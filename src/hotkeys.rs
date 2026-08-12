@@ -34,7 +34,8 @@ impl HotkeyBus {
 fn poll_loop(tx: mpsc::Sender<Action>, bindings: Arc<Mutex<BindingsMap>>) {
     let mut prev: HashMap<Action, bool> = HashMap::new();
     loop {
-        let league = league_is_frontmost();
+        let front = frontmost_display_name();
+        let armed = should_arm(&front);
         let map = bindings.lock().ok().map(|g| g.clone()).unwrap_or_default();
         let cmd = key_down(55) || key_down(54);
         let shift = key_down(56) || key_down(60);
@@ -45,12 +46,12 @@ fn poll_loop(tx: mpsc::Sender<Action>, bindings: Arc<Mutex<BindingsMap>>) {
             let chord = bindings::chord_of(&map, *action);
             let down = chord_held(chord, cmd, shift, alt, ctrl);
             let was = prev.get(action).copied().unwrap_or(false);
-            if league && down && !was {
+            if armed && down && !was {
                 let _ = tx.send(*action);
             }
             prev.insert(*action, down);
         }
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -58,9 +59,13 @@ fn chord_held(c: Chord, cmd: bool, shift: bool, alt: bool, ctrl: bool) -> bool {
     key_down(c.key as i32) && c.cmd == cmd && c.shift == shift && c.alt == alt && c.ctrl == ctrl
 }
 
+/// Hardware HID state (1). Combined session state (0) often stays false for
+/// keys that went to another app — which is why Space/K did nothing in League.
+const HID_SYSTEM_STATE: i32 = 1;
+
 #[cfg(target_os = "macos")]
 fn key_down(code: i32) -> bool {
-    unsafe { CGEventSourceKeyState(0, code as u16) }
+    unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, code as u16) }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -101,14 +106,40 @@ pub fn is_league_name(name: &str) -> bool {
     s.contains("league of legends") || s.contains("leagueoflegends")
 }
 
-fn league_is_frontmost() -> bool {
-    is_league_name(&frontmost_display_name())
+#[allow(dead_code)]
+pub fn is_director_main(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("league director")
+}
+
+/// HUD window title is just "Director" (not "League Director").
+pub fn is_director_hud(name: &str) -> bool {
+    let s = name.to_ascii_lowercase();
+    (s.contains("director") && !s.contains("league director")) || s.contains("director hud")
+}
+
+/// Global poll fires in League. It also fires for the HUD, because the HUD
+/// viewport often does not receive egui key events. It does *not* fire for
+/// the main Director window (egui handles those — both would toggle twice).
+pub fn should_arm(front: &str) -> bool {
+    is_league_name(front) || is_director_hud(front)
+}
+
+pub fn debug_snapshot() -> String {
+    let front = frontmost_display_name();
+    let armed = should_arm(&front);
+    format!(
+        "front={} · armed={} · hid space={} k={}",
+        front.replace('\n', " ").trim(),
+        if armed { "yes" } else { "no" },
+        key_down(49) as u8,
+        key_down(40) as u8
+    )
 }
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
 }
 
 #[cfg(test)]
@@ -122,5 +153,9 @@ mod tests {
         assert!(!is_league_name(r#""LSDisplayName"="LeagueClient""#));
         assert!(!is_league_name(r#""LSDisplayName"="Riot Client""#));
         assert!(!is_league_name(r#""LSDisplayName"="Discord""#));
+        assert!(should_arm(r#""LSDisplayName"="League Of Legends""#));
+        assert!(should_arm(r#""LSDisplayName"="Director""#));
+        assert!(!should_arm(r#""LSDisplayName"="League Director""#));
+        assert!(!should_arm(r#""LSDisplayName"="Google Chrome""#));
     }
 }

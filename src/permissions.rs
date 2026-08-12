@@ -57,6 +57,18 @@ pub fn input_monitoring_ok() -> bool {
     unsafe { CGPreflightListenEventAccess() }
 }
 
+#[cfg(target_os = "macos")]
+pub fn request_hotkey_permissions() {
+    unsafe {
+        let opts = std::ptr::null();
+        AXIsProcessTrustedWithOptions(opts);
+        let _ = CGRequestListenEventAccess();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn request_hotkey_permissions() {}
+
 #[cfg(not(target_os = "macos"))]
 pub fn input_monitoring_ok() -> bool {
     true
@@ -122,10 +134,12 @@ pub fn install_to_applications() -> Result<PathBuf, String> {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
 }
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
 }

@@ -70,11 +70,13 @@ pub struct DirectorApp {
     pending_rofl: Option<PathBuf>,
     rec_blocked: bool,
     last_clip_secs: Option<f64>,
+    last_hotkey: String,
 }
 
 impl DirectorApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_theme(&cc.egui_ctx);
+        permissions::request_hotkey_permissions();
         let mut settings = Settings::load();
         if settings.record_dir.trim().is_empty() {
             settings.record_dir = detect::preferred_record_dir().display().to_string();
@@ -139,6 +141,7 @@ impl DirectorApp {
             pending_rofl: None,
             rec_blocked: false,
             last_clip_secs: None,
+            last_hotkey: String::new(),
         }
     }
 
@@ -364,31 +367,32 @@ impl DirectorApp {
     }
 
     fn apply_action(&mut self, action: Action) {
+        self.last_hotkey = format!("{} @ {}", action.label(), Playback::format_time(self.playback.time));
         match action {
             Action::PlayPause => {
-                if self.connected {
-                    self.post_playback(serde_json::json!({ "paused": !self.playback.paused }));
-                }
+                let paused = !self.playback.paused;
+                self.post_playback(serde_json::json!({ "paused": paused }));
+                self.playback.paused = paused;
+                self.status = format!(
+                    "{} · {}",
+                    if paused { "Paused" } else { "Playing" },
+                    self.last_hotkey
+                );
             }
             Action::Keyframe => {
-                if self.connected {
-                    self.add_camera_keyframes();
-                    self.tab = 4;
-                }
+                self.add_camera_keyframes();
+                self.tab = 4;
+                self.status = format!("Keyframe · {}", self.last_hotkey);
             }
             Action::SeekBack | Action::TimeMinus5 => {
-                if self.connected {
-                    self.post_playback(serde_json::json!({
-                        "time": (self.playback.time - 5.0).max(0.0)
-                    }));
-                }
+                let t = (self.playback.time - 5.0).max(0.0);
+                self.post_playback(serde_json::json!({ "time": t }));
+                self.playback.time = t;
             }
             Action::SeekFwd | Action::TimePlus5 => {
-                if self.connected {
-                    self.post_playback(serde_json::json!({
-                        "time": (self.playback.time + 5.0).min(self.playback.length)
-                    }));
-                }
+                let t = (self.playback.time + 5.0).min(self.playback.length);
+                self.post_playback(serde_json::json!({ "time": t }));
+                self.playback.time = t;
             }
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
@@ -669,6 +673,7 @@ impl eframe::App for DirectorApp {
                     Color32::from_rgb(220, 120, 80)
                 };
                 ui.label(RichText::new(&self.status).color(color));
+                ui.label(RichText::new(crate::hotkeys::debug_snapshot()).small().weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(self.settings.show_hud, "HUD").clicked() {
                         self.settings.show_hud = !self.settings.show_hud;
@@ -1719,6 +1724,10 @@ impl DirectorApp {
                     self.apply_action(Action::Cinematic);
                 }
             });
+            ui.label(RichText::new(crate::hotkeys::debug_snapshot()).small());
+            if !self.last_hotkey.is_empty() {
+                ui.label(RichText::new(&self.last_hotkey).small().color(Color32::from_rgb(80, 200, 140)));
+            }
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "{} / {}   {}",
