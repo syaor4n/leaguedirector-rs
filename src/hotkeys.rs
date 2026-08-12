@@ -117,11 +117,40 @@ pub fn is_director_hud(name: &str) -> bool {
     (s.contains("director") && !s.contains("league director")) || s.contains("director hud")
 }
 
-/// Global poll fires in League. It also fires for the HUD, because the HUD
-/// viewport often does not receive egui key events. It does *not* fire for
-/// the main Director window (egui handles those — both would toggle twice).
+fn is_blocked_desktop(name: &str) -> bool {
+    let s = name.to_ascii_lowercase();
+    [
+        "google chrome",
+        "safari",
+        "firefox",
+        "discord",
+        "iterm",
+        "terminal",
+        "code",
+        "cursor",
+        "slack",
+        "finder",
+        "mail",
+        "spotify",
+        "notes",
+        "promethee",
+        "league director",
+    ]
+    .iter()
+    .any(|n| s.contains(n))
+}
+
+/// Global poll fires in League. Exclusive fullscreen often reports a blank or
+/// odd frontmost name, so if the game process is alive and you are not in a
+/// desktop app, we still arm. Main Director stays disarmed (egui handles it).
 pub fn should_arm(front: &str) -> bool {
-    is_league_name(front) || is_director_hud(front)
+    if is_director_main(front) {
+        return false;
+    }
+    if is_league_name(front) || is_director_hud(front) {
+        return true;
+    }
+    crate::detect::game_pid().is_some() && !is_blocked_desktop(front)
 }
 
 pub fn debug_snapshot() -> String {
@@ -158,4 +187,15 @@ mod tests {
         assert!(!should_arm(r#""LSDisplayName"="League Director""#));
         assert!(!should_arm(r#""LSDisplayName"="Google Chrome""#));
     }
+}
+
+pub fn notify(title: &str, body: &str) {
+    let title = title.replace('"', "'");
+    let body = body.replace('"', "'");
+    let script = format!(
+        r#"display notification "{body}" with title "{title}" sound name "Tink""#
+    );
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .spawn();
 }

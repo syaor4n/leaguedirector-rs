@@ -373,16 +373,15 @@ impl DirectorApp {
                 let paused = !self.playback.paused;
                 self.post_playback(serde_json::json!({ "paused": paused }));
                 self.playback.paused = paused;
-                self.status = format!(
-                    "{} · {}",
-                    if paused { "Paused" } else { "Playing" },
-                    self.last_hotkey
-                );
+                let label = if paused { "Paused" } else { "Playing" };
+                self.status = format!("{} · {}", label, self.last_hotkey);
+                crate::hotkeys::notify("League Director", label);
             }
             Action::Keyframe => {
                 self.add_camera_keyframes();
                 self.tab = 4;
                 self.status = format!("Keyframe · {}", self.last_hotkey);
+                crate::hotkeys::notify("League Director", "Keyframe");
             }
             Action::SeekBack | Action::TimeMinus5 => {
                 let t = (self.playback.time - 5.0).max(0.0);
