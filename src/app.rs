@@ -13,7 +13,16 @@ use crate::presets;
 use crate::seq_lib;
 use crate::sequence_ui::{self, TrackEvent, TrackId};
 use crate::settings::Settings;
-use eframe::egui::{self, Color32, RichText, Slider, Ui};
+use eframe::egui::{self, Color32, FontId, RichText, Slider, Ui};
+
+const COL_BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x18);
+const COL_PANEL: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x22);
+const COL_LIVE: Color32 = Color32::from_rgb(0x3D, 0xCF, 0x8E);
+const COL_REC: Color32 = Color32::from_rgb(0xE2, 0x4B, 0x4A);
+const COL_AMBER: Color32 = Color32::from_rgb(0xE8, 0xA2, 0x3A);
+const COL_TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xEA);
+const COL_MUTE: Color32 = Color32::from_rgb(0x8B, 0x8B, 0x93);
+
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -94,7 +103,7 @@ impl DirectorApp {
         }
         let bindings = settings.bindings.clone();
         let seq_name = settings.last_sequence.clone();
-        let tab = settings.last_tab;
+        let tab = map_desk(settings.last_tab);
         let edits = std::sync::Arc::new(std::sync::Mutex::new(EditStack::default()));
         Self {
             client,
@@ -686,8 +695,8 @@ impl eframe::App for DirectorApp {
                 egui::ViewportId::from_hash_of("director_hud"),
                 egui::ViewportBuilder::default()
                     .with_title("Director")
-                    .with_inner_size([460.0, 92.0])
-                    .with_min_inner_size([320.0, 72.0])
+                    .with_inner_size([520.0, 76.0])
+                    .with_min_inner_size([360.0, 64.0])
                     .with_always_on_top()
                     .with_maximize_button(false)
                     .with_close_button(true),
@@ -704,79 +713,84 @@ impl eframe::App for DirectorApp {
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("League Director");
-                ui.separator();
-                let color = if self.connected {
-                    Color32::from_rgb(80, 200, 140)
+                ui.label(RichText::new("League Director").strong().size(16.0));
+                ui.add_space(8.0);
+                let (lamp, live) = if self.recording.recording {
+                    (COL_REC, "REC")
+                } else if self.connected {
+                    (COL_LIVE, "live")
                 } else if self.lcu_busy {
-                    Color32::from_rgb(230, 190, 80)
+                    (COL_AMBER, "starting")
                 } else {
-                    Color32::from_rgb(220, 120, 80)
+                    (COL_MUTE, "idle")
                 };
-                ui.label(RichText::new(&self.status).color(color));
+                ui.colored_label(lamp, "●");
+                ui.label(
+                    RichText::new(format!(
+                        "{live}  {} / {}",
+                        Playback::format_time(self.playback.time),
+                        Playback::format_time(self.playback.length)
+                    ))
+                    .font(FontId::monospace(13.0))
+                    .color(COL_TEXT),
+                );
+                ui.separator();
                 ui.label(
                     RichText::new(if crate::hotkeys::tap_is_live() {
-                        "keys: on"
+                        "keys on"
                     } else {
-                        "keys: off"
+                        "keys off"
                     })
                     .small()
-                    .weak(),
+                    .color(if crate::hotkeys::tap_is_live() {
+                        COL_LIVE
+                    } else {
+                        COL_MUTE
+                    }),
                 );
+                ui.label(RichText::new(&self.status).small().color(COL_MUTE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(self.settings.show_hud, "HUD").clicked() {
                         self.settings.show_hud = !self.settings.show_hud;
                         self.settings.save();
                     }
-                    if ui.button("Files & Folders").clicked() {
-                        permissions::open_files_privacy();
+                    if ui.button("Reset").clicked() {
+                        self.reset_look();
                     }
-                    if ui.button("Grant keys").clicked() {
+                    if ui.button("Undo").clicked() {
+                        self.undo();
+                    }
+                    if !crate::hotkeys::tap_is_live() && ui.button("Grant keys").clicked() {
                         permissions::request_hotkey_permissions();
-                    }
-                    if ui.button("Refresh").clicked() {
-                        self.installs = detect::find_installs();
-                        self.rofls = detect::list_rofls();
-                        self.skyboxes = detect::list_skyboxes();
-                        self.perm_ax = permissions::accessibility_trusted();
-                        self.perm_input = permissions::input_monitoring_ok();
-                        self.perm_docs = permissions::documents_ok();
                     }
                 });
             });
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                for (i, label) in [
-                    "Connect",
-                    "Timeline",
-                    "Render",
-                    "Visibility",
-                    "Sequencer",
-                    "Recording",
-                    "Particles",
-                    "Keys",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    if ui.selectable_label(self.tab == i, *label).clicked() {
+                for (i, label) in ["Connect", "Look", "Cut", "Capture"].iter().enumerate() {
+                    let selected = self.tab == i;
+                    let text = if selected {
+                        RichText::new(*label).strong().color(COL_AMBER)
+                    } else {
+                        RichText::new(*label).color(COL_MUTE)
+                    };
+                    if ui.selectable_label(selected, text).clicked() {
                         self.tab = i;
                         self.settings.last_tab = i;
                         self.settings.save();
                     }
                 }
             });
+            ui.add_space(4.0);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             0 => self.ui_connect(ui),
-            1 => self.ui_timeline(ui),
-            2 => self.ui_render(ui),
-            3 => self.ui_visibility(ui),
-            4 => self.ui_sequence(ui),
-            5 => self.ui_recording(ui),
-            6 => self.ui_particles(ui),
-            _ => self.ui_keys(ui),
+            1 => self.ui_look(ui),
+            2 => self.ui_cut(ui),
+            _ => self.ui_capture(ui),
         });
     }
 
@@ -786,55 +800,70 @@ impl eframe::App for DirectorApp {
 }
 
 impl DirectorApp {
+    fn ui_look(&mut self, ui: &mut Ui) {
+        self.ui_timeline(ui);
+        ui.add_space(8.0);
+        ui.separator();
+        self.ui_render(ui);
+    }
+
+    fn ui_cut(&mut self, ui: &mut Ui) {
+        self.ui_sequence(ui);
+        ui.add_space(8.0);
+        ui.collapsing("Visibility", |ui| self.ui_visibility(ui));
+        ui.collapsing("Particles", |ui| self.ui_particles(ui));
+    }
+
+    fn ui_capture(&mut self, ui: &mut Ui) {
+        self.ui_recording(ui);
+    }
+
     fn ui_connect(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("macOS permissions").strong());
-        perm_row(ui, "Accessibility (global hotkeys)", self.perm_ax, || {
-            permissions::request_hotkey_permissions();
-        });
-        perm_row(ui, "Input Monitoring (read keys in League)", self.perm_input, || {
-            permissions::request_hotkey_permissions();
-        });
-        if !self.perm_ax || !self.perm_input {
-            ui.label(
-                RichText::new("Grant names this app. After you allow, restart League Director.")
-                    .small()
-                    .weak(),
-            );
-            if ui.small_button("Open Settings only if the prompt did not appear").clicked() {
-                permissions::open_privacy_settings();
+        let perms_ok = self.perm_ax && self.perm_input && self.perm_docs && self.from_bundle;
+        if !perms_ok {
+            ui.label(RichText::new("Permissions").strong());
+            if !self.perm_ax {
+                perm_row(ui, "Accessibility (global hotkeys)", self.perm_ax, || {
+                    permissions::request_hotkey_permissions();
+                });
             }
-        }
-        perm_row(ui, "Documents / Files and Folders", self.perm_docs, || {
-            permissions::open_files_privacy();
-        });
-        perm_row(
-            ui,
-            if self.from_bundle {
-                "Running as League Director.app"
-            } else {
-                "Running from cargo — TCC grants will not stick to the .app"
-            },
-            self.from_bundle,
-            || {},
-        );
-        ui.horizontal(|ui| {
-            if ui.button("Install to /Applications").clicked() {
-                match permissions::install_to_applications() {
-                    Ok(p) => {
-                        self.status = format!("Installed {}", p.display());
-                        permissions::open_folder(&p);
+            if !self.perm_input {
+                perm_row(ui, "Input Monitoring (read keys in League)", self.perm_input, || {
+                    permissions::request_hotkey_permissions();
+                });
+            }
+            if !self.perm_docs {
+                perm_row(ui, "Documents / Files and Folders", self.perm_docs, || {
+                    permissions::open_files_privacy();
+                });
+            }
+            if !self.from_bundle {
+                perm_row(
+                    ui,
+                    "Running from cargo — TCC grants will not stick to the .app",
+                    false,
+                    || {},
+                );
+                if ui.button("Install to /Applications").clicked() {
+                    match permissions::install_to_applications() {
+                        Ok(p) => {
+                            self.status = format!("Installed {}", p.display());
+                            permissions::open_folder(&p);
+                        }
+                        Err(e) => self.status = e,
                     }
-                    Err(e) => self.status = e,
                 }
             }
-            ui.label(
-                RichText::new("Then open that copy and grant the three privacy toggles to it.")
-                    .small()
-                    .weak(),
-            );
-        });
-        ui.separator();
-        ui.label(RichText::new("Live status").strong());
+            if (!self.perm_ax || !self.perm_input)
+                && ui
+                    .small_button("Open Settings only if the prompt did not appear")
+                    .clicked()
+            {
+                permissions::open_privacy_settings();
+            }
+            ui.separator();
+        }
+        ui.label(RichText::new("Stage").strong());
         perm_row(ui, "LCU (League client lockfile)", self.lcu_ok, || {});
         perm_row(ui, "LeagueofLegends process", self.game_ok, || {});
         perm_row(ui, "Replay API https://127.0.0.1:2999", self.api_ok, || {});
@@ -953,6 +982,8 @@ impl DirectorApp {
         }
         ui.add_space(8.0);
         ui.label("Replay API: https://127.0.0.1:2999  ·  not affiliated with Riot Games.");
+        ui.add_space(12.0);
+        ui.collapsing("Key bindings", |ui| self.ui_keys(ui));
     }
 
     fn ui_timeline(&mut self, ui: &mut Ui) {
@@ -1828,10 +1859,17 @@ impl DirectorApp {
                 }
             });
             ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "{} / {}",
+                        Playback::format_time(self.playback.time),
+                        Playback::format_time(self.playback.length)
+                    ))
+                    .font(FontId::monospace(16.0))
+                    .color(COL_TEXT),
+                );
                 ui.label(format!(
-                    "{} / {}   {}",
-                    Playback::format_time(self.playback.time),
-                    Playback::format_time(self.playback.length),
+                    "  {}",
                     if self.recording.recording {
                         "REC"
                     } else if self.connected {
@@ -1887,11 +1925,7 @@ fn spawn_watch(tx: Sender<BgEvent>, path: PathBuf) {
 
 fn perm_row(ui: &mut Ui, label: &str, ok: bool, on_fix: impl FnOnce()) {
     ui.horizontal(|ui| {
-        let c = if ok {
-            Color32::from_rgb(80, 200, 140)
-        } else {
-            Color32::from_rgb(220, 120, 80)
-        };
+        let c = if ok { COL_LIVE } else { COL_REC };
         ui.colored_label(c, if ok { "OK" } else { "NO" });
         ui.label(label);
         if !ok && ui.small_button("Fix").clicked() {
@@ -1900,12 +1934,34 @@ fn perm_row(ui: &mut Ui, label: &str, ok: bool, on_fix: impl FnOnce()) {
     });
 }
 
+fn map_desk(old: usize) -> usize {
+    match old {
+        0 | 7 => 0,
+        1 | 2 => 1,
+        3 | 4 | 6 => 2,
+        5 => 3,
+        t if t <= 3 => t,
+        _ => 0,
+    }
+}
+
 fn apply_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(36, 36, 40);
-    visuals.window_fill = Color32::from_rgb(42, 42, 48);
-    visuals.override_text_color = Some(Color32::from_rgb(210, 210, 214));
+    visuals.panel_fill = COL_BG;
+    visuals.window_fill = COL_PANEL;
+    visuals.extreme_bg_color = Color32::from_rgb(0x12, 0x12, 0x14);
+    visuals.faint_bg_color = COL_PANEL;
+    visuals.override_text_color = Some(COL_TEXT);
+    visuals.widgets.noninteractive.fg_stroke.color = COL_MUTE;
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x28, 0x28, 0x2E);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x32, 0x32, 0x3A);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(0x3A, 0x32, 0x24);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xE8, 0xA2, 0x3A, 60);
+    visuals.hyperlink_color = COL_AMBER;
+    visuals.warn_fg_color = COL_AMBER;
+    visuals.error_fg_color = COL_REC;
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.visuals = visuals;
     ctx.set_style(style);
 }

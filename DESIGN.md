@@ -1,6 +1,6 @@
-# League Director — UI direction (not implemented yet)
+# League Director — UI direction
 
-Approve this before we restyle the live app.
+Shipped as four desks (Connect / Look / Cut / Capture) plus a compact HUD.
 
 ## Problem
 
