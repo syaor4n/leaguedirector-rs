@@ -36,6 +36,16 @@ In System Settings, grant **League Director.app** (not `cargo`):
 - Privacy & Security → Input Monitoring
 - Privacy & Security → Files and Folders (Documents)
 
+## First launch (macOS)
+
+1. `./scripts/macos-bundle.sh` then **Install to /Applications** (Connect tab), or copy the `.app` yourself.
+2. Open **that** app (not `cargo run`) and grant Accessibility, Input Monitoring, and Files and Folders.
+3. Tick your League install, Watch a `.rofl`, keep the HUD on top while filming.
+
+Global hotkeys fire only while **League of Legends** (the game) is frontmost. Remap them in the Keys tab.
+
+Recording: the game API often stalls while encoding. Director starts a watchdog and remuxes `.webm.tmp` → `.webm` (bundled `ffmpeg` if present). Clips show up in the Recording tab.
+
 ## Usage
 
 1. Connect tab: tick your League install (`EnableReplayApi=1`).

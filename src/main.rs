@@ -1,10 +1,13 @@
 mod api;
 mod app;
+mod bindings;
 mod detect;
 mod hotkeys;
 mod lcu;
 mod media;
 mod permissions;
+mod presets;
+mod seq_lib;
 mod sequence_ui;
 mod settings;
 

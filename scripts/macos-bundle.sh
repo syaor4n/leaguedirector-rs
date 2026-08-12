@@ -12,6 +12,12 @@ if [[ ! -d "$APP" ]]; then
   exit 1
 fi
 
+# Bundle ffmpeg next to the binary so remux works without Homebrew.
+if command -v ffmpeg >/dev/null 2>&1; then
+  cp "$(command -v ffmpeg)" "$APP/Contents/MacOS/ffmpeg"
+  chmod +x "$APP/Contents/MacOS/ffmpeg"
+fi
+
 # cargo-bundle already merges assets/Info.plist.ext. Re-sign so TCC sees a stable identity.
 codesign --force --deep --sign - "$APP"
 codesign --verify --verbose=2 "$APP" || true

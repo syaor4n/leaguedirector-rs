@@ -1,12 +1,15 @@
 use crate::api::{
     upsert_kf, Color, Playback, Particles, Recording, Render, ReplayClient, Sequence, Vec3,
 };
+use crate::bindings::{self, Action};
 use crate::detect::{self, GameInstall};
-use crate::hotkeys::{Hotkey, HotkeyBus};
+use crate::hotkeys::HotkeyBus;
 use crate::lcu;
 use crate::media;
 use crate::permissions;
-use crate::sequence_ui::{self, TrackEvent};
+use crate::presets;
+use crate::seq_lib;
+use crate::sequence_ui::{self, TrackEvent, TrackId};
 use crate::settings::Settings;
 use eframe::egui::{self, Color32, RichText, Slider, Ui};
 use std::path::PathBuf;
@@ -17,6 +20,7 @@ use std::time::{Duration, Instant};
 enum BgEvent {
     Status(String),
     RoflOpened(PathBuf),
+    ClipReady(PathBuf),
 }
 
 pub struct DirectorApp {
@@ -52,6 +56,12 @@ pub struct DirectorApp {
     lcu_line: String,
     last_lcu_check: Instant,
     dragging_kf: bool,
+    seq_name: String,
+    selected_kf: Option<(TrackId, usize)>,
+    perm_ax: bool,
+    perm_input: bool,
+    perm_docs: bool,
+    from_bundle: bool,
 }
 
 impl DirectorApp {
@@ -72,9 +82,12 @@ impl DirectorApp {
                 spawn_watch(bg_tx.clone(), PathBuf::from(arg));
             }
         }
+        let bindings = settings.bindings.clone();
+        let seq_name = settings.last_sequence.clone();
+        let tab = settings.last_tab;
         Self {
             client,
-            tab: settings.last_tab,
+            tab,
             rec_codec: "webm".into(),
             rec_fps: 30.0,
             rec_start: 0.0,
@@ -82,7 +95,7 @@ impl DirectorApp {
             particle_filter: String::new(),
             apply_sequence: false,
             settings,
-            hotkeys: HotkeyBus::start(),
+            hotkeys: HotkeyBus::start(bindings),
             bg_tx,
             bg_rx,
             connected: false,
@@ -105,6 +118,12 @@ impl DirectorApp {
             lcu_line: String::new(),
             last_lcu_check: Instant::now() - Duration::from_secs(10),
             dragging_kf: false,
+            seq_name,
+            selected_kf: None,
+            perm_ax: permissions::accessibility_trusted(),
+            perm_input: permissions::input_monitoring_ok(),
+            perm_docs: permissions::documents_ok(),
+            from_bundle: permissions::running_from_bundle(),
         }
     }
 
@@ -133,6 +152,11 @@ impl DirectorApp {
                     self.lcu_busy = false;
                     self.status = format!("Replay requested: {}", path.display());
                     self.rofls = detect::list_rofls();
+                }
+                BgEvent::ClipReady(path) => {
+                    self.status = format!("Capture ready: {}", path.display());
+                    self.last_capture = Some(path.clone());
+                    self.settings.remember_clip(&path);
                 }
             }
         }
@@ -268,78 +292,174 @@ impl DirectorApp {
         self.push_sequence();
     }
 
-    fn apply_hotkey(&mut self, key: Hotkey) {
-        if !self.connected {
-            return;
-        }
-        match key {
-            Hotkey::PlayPause => {
-                self.post_playback(serde_json::json!({ "paused": !self.playback.paused }));
+    fn apply_action(&mut self, action: Action) {
+        match action {
+            Action::PlayPause => {
+                if self.connected {
+                    self.post_playback(serde_json::json!({ "paused": !self.playback.paused }));
+                }
             }
-            Hotkey::Keyframe => {
-                self.add_camera_keyframes();
-                self.tab = 4;
+            Action::Keyframe => {
+                if self.connected {
+                    self.add_camera_keyframes();
+                    self.tab = 4;
+                }
             }
-            Hotkey::SeekBack => {
-                self.post_playback(serde_json::json!({
-                    "time": (self.playback.time - 5.0).max(0.0)
-                }));
+            Action::SeekBack | Action::TimeMinus5 => {
+                if self.connected {
+                    self.post_playback(serde_json::json!({
+                        "time": (self.playback.time - 5.0).max(0.0)
+                    }));
+                }
             }
-            Hotkey::SeekFwd => {
-                self.post_playback(serde_json::json!({
-                    "time": (self.playback.time + 5.0).min(self.playback.length)
-                }));
+            Action::SeekFwd | Action::TimePlus5 => {
+                if self.connected {
+                    self.post_playback(serde_json::json!({
+                        "time": (self.playback.time + 5.0).min(self.playback.length)
+                    }));
+                }
             }
-            Hotkey::Undo => self.undo(),
-            Hotkey::Redo => self.redo(),
-            Hotkey::PlaySeq => {
+            Action::Undo => self.undo(),
+            Action::Redo => self.redo(),
+            Action::PlaySeq => {
                 if let Some(start) = self.sequence.first_time() {
                     self.apply_sequence = true;
                     self.push_sequence();
                     self.post_playback(serde_json::json!({ "time": start, "paused": false }));
                 }
             }
+            Action::ToggleHud => {
+                self.post_render(serde_json::json!({ "interfaceAll": !self.render.interface_all }));
+            }
+            Action::ToggleFow => {
+                self.post_render(serde_json::json!({ "fogOfWar": !self.render.fog_of_war }));
+            }
+            Action::ToggleAttach => {
+                self.post_render(serde_json::json!({ "cameraAttached": !self.render.camera_attached }));
+            }
+            Action::RecordToggle => {
+                if self.recording.recording {
+                    let _ = self.client.set_recording(&serde_json::json!({ "recording": false }));
+                } else if self.connected {
+                    let start = self.playback.time;
+                    self.start_recording(start, (start + 8.0).min(self.playback.length.max(start + 0.5)));
+                }
+            }
+            Action::Cinematic => {
+                let _ = self.client.set_render(&presets::cinematic());
+            }
+            Action::Gameplay => {
+                let _ = self.client.set_render(&presets::gameplay());
+            }
+            Action::NextKf => self.step_kf(1),
+            Action::PrevKf => self.step_kf(-1),
+            Action::DeleteKf => self.delete_selected_kf(),
         }
     }
 
     fn handle_hotkeys(&mut self, ctx: &egui::Context) {
         if !ctx.wants_keyboard_input() {
-            let space = ctx.input(|i| i.key_pressed(egui::Key::Space));
-            let key_k = ctx.input(|i| i.key_pressed(egui::Key::K));
-            let left = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-            let right = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-            let undo =
-                ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift);
-            let redo = ctx.input(|i| {
-                (i.modifiers.command && i.key_pressed(egui::Key::Z) && i.modifiers.shift)
-                    || (i.modifiers.command && i.key_pressed(egui::Key::Y))
-            });
-            let play_seq = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-            if space {
-                self.apply_hotkey(Hotkey::PlayPause);
-            }
-            if key_k {
-                self.apply_hotkey(Hotkey::Keyframe);
-            }
-            if left {
-                self.apply_hotkey(Hotkey::SeekBack);
-            }
-            if right {
-                self.apply_hotkey(Hotkey::SeekFwd);
-            }
-            if undo {
-                self.apply_hotkey(Hotkey::Undo);
-            }
-            if redo {
-                self.apply_hotkey(Hotkey::Redo);
-            }
-            if play_seq {
-                self.apply_hotkey(Hotkey::PlaySeq);
+            for action in Action::ALL {
+                let chord = bindings::chord_of(&self.settings.bindings, *action);
+                if bindings::egui_pressed(ctx, chord) {
+                    self.apply_action(*action);
+                }
             }
         }
         while let Some(k) = self.hotkeys.try_recv() {
-            self.apply_hotkey(k);
+            self.apply_action(k);
         }
+    }
+
+    fn kf_index(&self) -> Vec<(TrackId, usize, f64)> {
+        let mut v = Vec::new();
+        for (i, k) in self.sequence.camera_position.iter().enumerate() {
+            v.push((TrackId::Position, i, k.time));
+        }
+        for (i, k) in self.sequence.camera_rotation.iter().enumerate() {
+            v.push((TrackId::Rotation, i, k.time));
+        }
+        for (i, k) in self.sequence.field_of_view.iter().enumerate() {
+            v.push((TrackId::Fov, i, k.time));
+        }
+        for (i, k) in self.sequence.playback_speed.iter().enumerate() {
+            v.push((TrackId::Speed, i, k.time));
+        }
+        for (i, k) in self.sequence.depth_fog_enabled.iter().enumerate() {
+            v.push((TrackId::Fog, i, k.time));
+        }
+        for (i, k) in self.sequence.depth_of_field_enabled.iter().enumerate() {
+            v.push((TrackId::Dof, i, k.time));
+        }
+        v.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    fn step_kf(&mut self, dir: i32) {
+        let all = self.kf_index();
+        if all.is_empty() {
+            return;
+        }
+        let cur = self.selected_kf.and_then(|(t, i)| {
+            all.iter().position(|(tt, ii, _)| *tt == t && *ii == i)
+        });
+        let idx = match cur {
+            Some(i) => {
+                let n = all.len() as i32;
+                ((i as i32 + dir).rem_euclid(n)) as usize
+            }
+            None => {
+                if dir >= 0 {
+                    0
+                } else {
+                    all.len() - 1
+                }
+            }
+        };
+        let (track, index, time) = all[idx];
+        self.selected_kf = Some((track, index));
+        self.post_playback(serde_json::json!({ "time": time, "paused": true }));
+    }
+
+    fn delete_selected_kf(&mut self) {
+        let Some((track, index)) = self.selected_kf else {
+            return;
+        };
+        self.snapshot();
+        match track {
+            TrackId::Position => {
+                if index < self.sequence.camera_position.len() {
+                    self.sequence.camera_position.remove(index);
+                }
+            }
+            TrackId::Rotation => {
+                if index < self.sequence.camera_rotation.len() {
+                    self.sequence.camera_rotation.remove(index);
+                }
+            }
+            TrackId::Fov => {
+                if index < self.sequence.field_of_view.len() {
+                    self.sequence.field_of_view.remove(index);
+                }
+            }
+            TrackId::Speed => {
+                if index < self.sequence.playback_speed.len() {
+                    self.sequence.playback_speed.remove(index);
+                }
+            }
+            TrackId::Fog => {
+                if index < self.sequence.depth_fog_enabled.len() {
+                    self.sequence.depth_fog_enabled.remove(index);
+                }
+            }
+            TrackId::Dof => {
+                if index < self.sequence.depth_of_field_enabled.len() {
+                    self.sequence.depth_of_field_enabled.remove(index);
+                }
+            }
+        }
+        self.selected_kf = None;
+        self.push_sequence();
     }
 
     fn open_rofl(&mut self, path: PathBuf) {
@@ -376,9 +496,18 @@ impl DirectorApp {
         self.status = format!("Recording → {}", path.display());
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let hint = path.display().to_string();
+        let dest = self.settings.record_dir.clone();
+        let span = (end - start).max(0.5);
         thread::spawn(move || {
             if let Err(e) = client.set_recording(&body) {
                 let _ = tx.send(BgEvent::Status(format!("Recording API: {e}")));
+            }
+        });
+        let tx2 = self.bg_tx.clone();
+        media::spawn_watchdog(hint, dest, span, move |maybe| {
+            if let Some(p) = maybe {
+                let _ = tx2.send(BgEvent::ClipReady(p));
             }
         });
     }
@@ -391,6 +520,27 @@ impl eframe::App for DirectorApp {
         self.poll();
         self.handle_hotkeys(ctx);
         ctx.request_repaint_after(Duration::from_millis(200));
+
+        if self.settings.show_hud {
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("director_hud"),
+                egui::ViewportBuilder::default()
+                    .with_title("Director HUD")
+                    .with_inner_size([460.0, 92.0])
+                    .with_min_inner_size([320.0, 72.0])
+                    .with_always_on_top()
+                    .with_maximize_button(false),
+                |ctx, class| {
+                    let _ = class;
+                    self.ui_hud(ctx);
+                    self.handle_hotkeys(ctx);
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        self.settings.show_hud = false;
+                        self.settings.save();
+                    }
+                },
+            );
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -405,6 +555,10 @@ impl eframe::App for DirectorApp {
                 };
                 ui.label(RichText::new(&self.status).color(color));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.selectable_label(self.settings.show_hud, "HUD").clicked() {
+                        self.settings.show_hud = !self.settings.show_hud;
+                        self.settings.save();
+                    }
                     if ui.button("Files & Folders").clicked() {
                         permissions::open_files_privacy();
                     }
@@ -415,6 +569,9 @@ impl eframe::App for DirectorApp {
                         self.installs = detect::find_installs();
                         self.rofls = detect::list_rofls();
                         self.skyboxes = detect::list_skyboxes();
+                        self.perm_ax = permissions::accessibility_trusted();
+                        self.perm_input = permissions::input_monitoring_ok();
+                        self.perm_docs = permissions::documents_ok();
                     }
                 });
             });
@@ -427,6 +584,7 @@ impl eframe::App for DirectorApp {
                     "Sequencer",
                     "Recording",
                     "Particles",
+                    "Keys",
                 ]
                 .iter()
                 .enumerate()
@@ -447,7 +605,8 @@ impl eframe::App for DirectorApp {
             3 => self.ui_visibility(ui),
             4 => self.ui_sequence(ui),
             5 => self.ui_recording(ui),
-            _ => self.ui_particles(ui),
+            6 => self.ui_particles(ui),
+            _ => self.ui_keys(ui),
         });
     }
 
@@ -458,6 +617,43 @@ impl eframe::App for DirectorApp {
 
 impl DirectorApp {
     fn ui_connect(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("macOS permissions").strong());
+        perm_row(ui, "Accessibility (global hotkeys)", self.perm_ax, || {
+            permissions::open_privacy_settings();
+        });
+        perm_row(ui, "Input Monitoring (read keys in League)", self.perm_input, || {
+            permissions::open_privacy_settings();
+        });
+        perm_row(ui, "Documents / Files and Folders", self.perm_docs, || {
+            permissions::open_files_privacy();
+        });
+        perm_row(
+            ui,
+            if self.from_bundle {
+                "Running as League Director.app"
+            } else {
+                "Running from cargo — TCC grants will not stick to the .app"
+            },
+            self.from_bundle,
+            || {},
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Install to /Applications").clicked() {
+                match permissions::install_to_applications() {
+                    Ok(p) => {
+                        self.status = format!("Installed {}", p.display());
+                        permissions::open_folder(&p);
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            ui.label(
+                RichText::new("Then open that copy and grant the three privacy toggles to it.")
+                    .small()
+                    .weak(),
+            );
+        });
+        ui.separator();
         ui.label("1. Tick an install to write EnableReplayApi=1 into game.cfg.");
         ui.label("2. Open a .rofl here (copied into League Replays + LCU watch) — do not pass it as argv.");
         ui.add_space(8.0);
@@ -602,6 +798,19 @@ impl DirectorApp {
         ui.add_enabled_ui(self.connected, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let client = self.client.clone();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Presets").strong());
+                    if ui.button("Cinematic").clicked() {
+                        let _ = client.set_render(&presets::cinematic());
+                    }
+                    if ui.button("Gameplay").clicked() {
+                        let _ = client.set_render(&presets::gameplay());
+                    }
+                    if ui.button("Broadcast").clicked() {
+                        let _ = client.set_render(&presets::broadcast());
+                    }
+                });
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Camera mode");
                     ui.label(&self.render.camera_mode);
@@ -889,10 +1098,77 @@ impl DirectorApp {
         ui.add_enabled_ui(self.connected, |ui| {
             ui.label(
                 RichText::new(
-                    "Shortcuts: Space play/pause · ←/→ ±5s · K keyframe · ⌘Z undo · Enter play sequence. Also work in League (Accessibility + Input Monitoring).",
+                    "Shortcuts (Keys tab to remap) also work while League is frontmost.",
                 )
                 .small(),
             );
+            ui.horizontal(|ui| {
+                ui.label("Sequence");
+                ui.text_edit_singleline(&mut self.seq_name);
+                if ui.button("New").clicked() {
+                    self.snapshot();
+                    self.sequence = Sequence::default();
+                    self.seq_name.clear();
+                    let _ = self.client.clear_sequence();
+                }
+                if ui.button("Save").clicked() {
+                    match seq_lib::save(&self.settings.sequence_dir, &self.seq_name, &self.sequence) {
+                        Ok(p) => {
+                            self.settings.last_sequence = self.seq_name.clone();
+                            self.settings.save();
+                            self.status = format!("Saved {}", p.display());
+                        }
+                        Err(e) => self.status = e,
+                    }
+                }
+                if ui.button("Copy").clicked() {
+                    if !self.seq_name.is_empty() {
+                        let name = format!("{} copy", self.seq_name);
+                        if seq_lib::save(&self.settings.sequence_dir, &name, &self.sequence).is_ok() {
+                            self.seq_name = name;
+                        }
+                    }
+                }
+                let files = seq_lib::list(&self.settings.sequence_dir);
+                let current = self.settings.last_sequence.clone();
+                egui::ComboBox::from_id_salt("seq-lib")
+                    .selected_text(if current.is_empty() {
+                        "(library)".into()
+                    } else {
+                        current
+                    })
+                    .show_ui(ui, |ui| {
+                        for p in files {
+                            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("seq");
+                            if ui.selectable_label(false, stem).clicked() {
+                                if let Ok(seq) = seq_lib::load(&p) {
+                                    self.snapshot();
+                                    self.sequence = seq;
+                                    self.seq_name = stem.to_string();
+                                    self.settings.last_sequence = stem.to_string();
+                                    self.apply_sequence = true;
+                                    self.push_sequence();
+                                    self.settings.save();
+                                }
+                            }
+                        }
+                    });
+                if ui.small_button("Folder").clicked() {
+                    let _ = std::fs::create_dir_all(&self.settings.sequence_dir);
+                    permissions::open_folder(std::path::Path::new(&self.settings.sequence_dir));
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Prev KF").clicked() {
+                    self.step_kf(-1);
+                }
+                if ui.button("Next KF").clicked() {
+                    self.step_kf(1);
+                }
+                if ui.button("Delete KF").clicked() {
+                    self.delete_selected_kf();
+                }
+            });
             if ui
                 .checkbox(&mut self.apply_sequence, "Apply sequence to replay")
                 .changed()
@@ -1184,6 +1460,122 @@ impl DirectorApp {
                 }
             });
         }
+        ui.separator();
+        ui.label(RichText::new("Clips").strong());
+        let rec_alt = detect::preferred_record_dir();
+        let dirs = [
+            self.settings.record_dir.as_str(),
+            rec_alt.to_str().unwrap_or(""),
+        ];
+        let clips = media::list_clips(&dirs);
+        if clips.is_empty() && self.settings.clips.is_empty() {
+            ui.label(RichText::new("No clips yet.").small().weak());
+        }
+        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+            for p in clips.into_iter().chain(
+                self.settings
+                    .clips
+                    .iter()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_file()),
+            ) {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        p.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("clip")
+                            .to_string(),
+                    );
+                    if ui.small_button("Reveal").clicked() {
+                        permissions::reveal_in_finder(&p);
+                    }
+                    if ui.small_button("Open").clicked() {
+                        permissions::open_folder(&p);
+                    }
+                });
+            }
+        });
+    }
+
+    fn ui_keys(&mut self, ui: &mut Ui) {
+        ui.label("Bindings apply in this window and while League of Legends is frontmost.");
+        ui.label(
+            RichText::new("Grant Accessibility + Input Monitoring to the .app, not to cargo.")
+                .small()
+                .weak(),
+        );
+        if ui.button("Reset to defaults").clicked() {
+            self.settings.bindings = bindings::default_map();
+            self.hotkeys.update_bindings(self.settings.bindings.clone());
+            self.settings.save();
+        }
+        let mut dirty = false;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for action in Action::ALL {
+                let id = action.id().to_string();
+                let mut value = self
+                    .settings
+                    .bindings
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| action.default_chord().to_string());
+                ui.horizontal(|ui| {
+                    ui.label(action.label());
+                    if ui.text_edit_singleline(&mut value).changed() {
+                        self.settings.bindings.insert(id, value);
+                        dirty = true;
+                    }
+                });
+            }
+        });
+        if dirty {
+            self.hotkeys.update_bindings(self.settings.bindings.clone());
+            self.settings.save();
+        }
+    }
+
+    fn ui_hud(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let play = if self.playback.paused { "Play" } else { "Pause" };
+                if ui.button(play).clicked() {
+                    self.apply_action(Action::PlayPause);
+                }
+                if ui.button("−5s").clicked() {
+                    self.apply_action(Action::SeekBack);
+                }
+                if ui.button("+5s").clicked() {
+                    self.apply_action(Action::SeekFwd);
+                }
+                if ui.button("K").clicked() {
+                    self.apply_action(Action::Keyframe);
+                }
+                if ui.button("Seq").clicked() {
+                    self.apply_action(Action::PlaySeq);
+                }
+                let rec = if self.recording.recording { "Stop rec" } else { "Rec" };
+                if ui.button(rec).clicked() {
+                    self.apply_action(Action::RecordToggle);
+                }
+                if ui.button("Cinema").clicked() {
+                    self.apply_action(Action::Cinematic);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} / {}   {}",
+                    Playback::format_time(self.playback.time),
+                    Playback::format_time(self.playback.length),
+                    if self.recording.recording {
+                        "REC"
+                    } else if self.connected {
+                        "live"
+                    } else {
+                        "idle"
+                    }
+                ));
+            });
+        });
     }
 
     fn ui_particles(&mut self, ui: &mut Ui) {
@@ -1217,6 +1609,21 @@ fn spawn_watch(tx: Sender<BgEvent>, path: PathBuf) {
             Err(e) => {
                 let _ = tx.send(BgEvent::Status(format!("LCU: {e}")));
             }
+        }
+    });
+}
+
+fn perm_row(ui: &mut Ui, label: &str, ok: bool, on_fix: impl FnOnce()) {
+    ui.horizontal(|ui| {
+        let c = if ok {
+            Color32::from_rgb(80, 200, 140)
+        } else {
+            Color32::from_rgb(220, 120, 80)
+        };
+        ui.colored_label(c, if ok { "OK" } else { "NO" });
+        ui.label(label);
+        if !ok && ui.small_button("Fix").clicked() {
+            on_fix();
         }
     });
 }
