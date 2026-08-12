@@ -4,6 +4,7 @@ use crate::api::{
 use crate::bindings::{self, Action};
 use crate::detect::{self, GameInstall};
 use crate::handshake::{self, WatchOutcome};
+use crate::edits::{Edit, EditStack};
 use crate::hotkeys::HotkeyBus;
 use crate::lcu;
 use crate::media;
@@ -48,8 +49,7 @@ pub struct DirectorApp {
     rec_end: f64,
     particle_filter: String,
     tab: usize,
-    undo: Vec<Sequence>,
-    redo: Vec<Sequence>,
+    edits: std::sync::Arc<std::sync::Mutex<EditStack>>,
     rofls: Vec<PathBuf>,
     selected_rofl: Option<PathBuf>,
     skyboxes: Vec<(String, PathBuf)>,
@@ -95,6 +95,7 @@ impl DirectorApp {
         let bindings = settings.bindings.clone();
         let seq_name = settings.last_sequence.clone();
         let tab = settings.last_tab;
+        let edits = std::sync::Arc::new(std::sync::Mutex::new(EditStack::default()));
         Self {
             client,
             tab,
@@ -105,7 +106,8 @@ impl DirectorApp {
             particle_filter: String::new(),
             apply_sequence: false,
             settings,
-            hotkeys: HotkeyBus::start(bindings),
+            hotkeys: HotkeyBus::start(bindings, std::sync::Arc::clone(&edits)),
+            edits,
             bg_tx,
             bg_rx,
             connected: false,
@@ -119,8 +121,6 @@ impl DirectorApp {
             last_capture: None,
             particles: Particles::default(),
             sequence: Sequence::default(),
-            undo: Vec::new(),
-            redo: Vec::new(),
             rofls,
             selected_rofl: None,
             skyboxes,
@@ -318,27 +318,49 @@ impl DirectorApp {
     }
 
     fn snapshot(&mut self) {
-        self.undo.push(self.sequence.clone());
-        if self.undo.len() > 80 {
-            self.undo.remove(0);
+        if let Ok(mut g) = self.edits.lock() {
+            g.push(Edit::Sequence(self.sequence.clone()));
         }
-        self.redo.clear();
+    }
+
+    fn snapshot_render(&mut self) {
+        if let Ok(mut g) = self.edits.lock() {
+            g.push(Edit::Render(self.render.clone()));
+        }
     }
 
     fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(self.sequence.clone());
-            self.sequence = prev;
-            self.push_sequence();
+        crate::hotkeys::apply_undo(&self.client, &self.edits);
+        if let Ok(r) = self.client.render() {
+            self.render = r;
         }
+        if let Ok(s) = self.client.sequence() {
+            self.sequence = s;
+        }
+        self.status = "Undo".into();
     }
 
     fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(self.sequence.clone());
-            self.sequence = next;
-            self.push_sequence();
+        crate::hotkeys::apply_redo(&self.client, &self.edits);
+        if let Ok(r) = self.client.render() {
+            self.render = r;
         }
+        if let Ok(s) = self.client.sequence() {
+            self.sequence = s;
+        }
+    }
+
+    fn reset_look(&mut self) {
+        self.snapshot_render();
+        let mut body = presets::gameplay();
+        if let serde_json::Value::Object(ref mut map) = body {
+            map.insert("fieldOfView".into(), serde_json::json!(40.0));
+            map.insert("depthOfFieldEnabled".into(), serde_json::json!(false));
+            map.insert("cameraMode".into(), serde_json::json!("fps"));
+        }
+        let _ = self.client.set_render(&body);
+        self.status = "Reset look: HUD back, DOF off, FOV 40. Camera position kept.".into();
+        crate::hotkeys::notify("League Director", "Look reset");
     }
 
     fn add_camera_keyframes(&mut self) {
@@ -403,12 +425,15 @@ impl DirectorApp {
                 }
             }
             Action::ToggleHud => {
+                self.snapshot_render();
                 self.post_render(serde_json::json!({ "interfaceAll": !self.render.interface_all }));
             }
             Action::ToggleFow => {
+                self.snapshot_render();
                 self.post_render(serde_json::json!({ "fogOfWar": !self.render.fog_of_war }));
             }
             Action::ToggleAttach => {
+                self.snapshot_render();
                 self.post_render(serde_json::json!({ "cameraAttached": !self.render.camera_attached }));
             }
             Action::RecordToggle => {
@@ -420,9 +445,11 @@ impl DirectorApp {
                 }
             }
             Action::Cinematic => {
+                self.snapshot_render();
                 let _ = self.client.set_render(&presets::cinematic());
             }
             Action::Gameplay => {
+                self.snapshot_render();
                 let _ = self.client.set_render(&presets::gameplay());
             }
             Action::NextKf => self.step_kf(1),
@@ -969,13 +996,22 @@ impl DirectorApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Presets").strong());
                     if ui.button("Cinematic").clicked() {
+                        self.snapshot_render();
                         let _ = client.set_render(&presets::cinematic());
                     }
                     if ui.button("Gameplay").clicked() {
+                        self.snapshot_render();
                         let _ = client.set_render(&presets::gameplay());
                     }
                     if ui.button("Broadcast").clicked() {
+                        self.snapshot_render();
                         let _ = client.set_render(&presets::broadcast());
+                    }
+                    if ui.button("Undo look (⌘Z)").clicked() {
+                        self.undo();
+                    }
+                    if ui.button("Reset look").clicked() {
+                        self.reset_look();
                     }
                 });
                 ui.separator();
@@ -995,9 +1031,20 @@ impl DirectorApp {
                 vec3_row(ui, "Rotation", &mut self.render.camera_rotation, |v| {
                     let _ = client.set_render(&serde_json::json!({ "cameraRotation": v }));
                 });
-                float_row(ui, "FOV", &mut self.render.field_of_view, 5.0..=120.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "fieldOfView": v }));
-                });
+                {
+                    let before = self.render.field_of_view;
+                    let resp = ui.add(Slider::new(&mut self.render.field_of_view, 5.0..=120.0).text("FOV"));
+                    if resp.drag_started() {
+                        let mut r = self.render.clone();
+                        r.field_of_view = before;
+                        if let Ok(mut g) = self.edits.lock() {
+                            g.push(Edit::Render(r));
+                        }
+                    }
+                    if resp.changed() {
+                        let _ = client.set_render(&serde_json::json!({ "fieldOfView": self.render.field_of_view }));
+                    }
+                }
                 float_row(ui, "Near clip", &mut self.render.near_clip, 0.1..=5000.0, |v| {
                     let _ = client.set_render(&serde_json::json!({ "nearClip": v }));
                 });
@@ -1744,6 +1791,12 @@ impl DirectorApp {
                 }
                 if ui.button("Cinema").clicked() {
                     self.apply_action(Action::Cinematic);
+                }
+                if ui.button("Undo").clicked() {
+                    self.undo();
+                }
+                if ui.button("Reset look").clicked() {
+                    self.reset_look();
                 }
             });
             ui.label(RichText::new(crate::hotkeys::debug_snapshot()).small());

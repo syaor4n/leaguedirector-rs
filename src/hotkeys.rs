@@ -1,5 +1,6 @@
-use crate::api::{upsert_kf, ReplayClient};
+use crate::api::{upsert_kf, Render, ReplayClient};
 use crate::bindings::{self, Action, Chord};
+use crate::edits::{Edit, EditStack};
 use crate::permissions;
 use serde_json::json;
 use std::collections::HashMap;
@@ -24,18 +25,21 @@ struct TapCtx {
     tx: mpsc::Sender<HotkeyNews>,
     bindings: Arc<Mutex<BindingsMap>>,
     client: ReplayClient,
+    edits: Arc<Mutex<EditStack>>,
+    tap: std::sync::atomic::AtomicPtr<c_void>,
 }
 
 impl HotkeyBus {
-    pub fn start(initial: BindingsMap) -> Self {
+    pub fn start(initial: BindingsMap, edits: Arc<Mutex<EditStack>>) -> Self {
         let (tx, rx) = mpsc::channel();
         let bindings = Arc::new(Mutex::new(initial));
         let shared = Arc::clone(&bindings);
         let tap_tx = tx.clone();
+        let edits_tap = Arc::clone(&edits);
         thread::spawn(move || {
-            if !install_event_tap(tap_tx.clone(), Arc::clone(&shared)) {
+            if !install_event_tap(tap_tx.clone(), Arc::clone(&shared), edits_tap) {
                 let _ = tap_tx.send(HotkeyNews::TapFailed);
-                poll_loop(tap_tx, shared);
+                poll_loop(tap_tx, shared, edits);
             }
         });
         Self { rx, bindings }
@@ -54,7 +58,7 @@ impl HotkeyBus {
 
 /// Run the Replay API call on this thread. The UI loop often sleeps while
 /// League is focused, so waiting for egui `update()` made Space look dead.
-fn fire(action: Action, client: &ReplayClient) {
+fn fire(action: Action, client: &ReplayClient, edits: &Arc<Mutex<EditStack>>) {
     match action {
         Action::PlayPause => {
             if let Ok(p) = client.playback() {
@@ -66,9 +70,28 @@ fn fire(action: Action, client: &ReplayClient) {
                 );
             }
         }
+        Action::Undo => {
+            apply_undo(client, edits);
+        }
+        Action::Redo => {
+            apply_redo(client, edits);
+        }
+        Action::Cinematic => {
+            push_render_checkpoint(client, edits);
+            let _ = client.set_render(&crate::presets::cinematic());
+            notify("League Director", "Cinematic");
+        }
+        Action::Gameplay => {
+            push_render_checkpoint(client, edits);
+            let _ = client.set_render(&crate::presets::gameplay());
+            notify("League Director", "Gameplay look");
+        }
         Action::Keyframe => {
             if let (Ok(p), Ok(r)) = (client.playback(), client.render()) {
                 let mut seq = client.sequence().unwrap_or_default();
+                if let Ok(mut g) = edits.lock() {
+                    g.push(Edit::Sequence(seq.clone()));
+                }
                 upsert_kf(&mut seq.camera_position, p.time, r.camera_position, "smoothStep");
                 upsert_kf(&mut seq.camera_rotation, p.time, r.camera_rotation, "smoothStep");
                 upsert_kf(&mut seq.field_of_view, p.time, r.field_of_view, "linear");
@@ -87,35 +110,101 @@ fn fire(action: Action, client: &ReplayClient) {
             }
         }
         Action::ToggleHud => {
+            push_render_checkpoint(client, edits);
             if let Ok(r) = client.render() {
                 let _ = client.set_render(&json!({ "interfaceAll": !r.interface_all }));
             }
         }
         Action::ToggleFow => {
+            push_render_checkpoint(client, edits);
             if let Ok(r) = client.render() {
                 let _ = client.set_render(&json!({ "fogOfWar": !r.fog_of_war }));
             }
-        }
-        Action::Cinematic => {
-            let _ = client.set_render(&crate::presets::cinematic());
-            notify("League Director", "Cinematic");
-        }
-        Action::Gameplay => {
-            let _ = client.set_render(&crate::presets::gameplay());
         }
         _ => {}
     }
 }
 
-fn maybe_fire(action: Action, client: &ReplayClient, tx: &mpsc::Sender<HotkeyNews>) {
+fn push_render_checkpoint(client: &ReplayClient, edits: &Arc<Mutex<EditStack>>) {
+    if let Ok(r) = client.render() {
+        if let Ok(mut g) = edits.lock() {
+            g.push(Edit::Render(r));
+        }
+    }
+}
+
+pub fn apply_undo(client: &ReplayClient, edits: &Arc<Mutex<EditStack>>) {
+    let item = edits.lock().ok().and_then(|mut g| g.pop_undo());
+    let Some(item) = item else {
+        notify("League Director", "Nothing to undo");
+        return;
+    };
+    match item {
+        Edit::Render(prev) => {
+            if let Ok(cur) = client.render() {
+                if let Ok(mut g) = edits.lock() {
+                    g.push_redo(Edit::Render(cur));
+                }
+            }
+            let _ = post_render(client, &prev);
+            notify("League Director", "Undo look");
+        }
+        Edit::Sequence(prev) => {
+            if let Ok(cur) = client.sequence() {
+                if let Ok(mut g) = edits.lock() {
+                    g.push_redo(Edit::Sequence(cur));
+                }
+            }
+            let _ = client.set_sequence(&prev);
+            notify("League Director", "Undo sequence");
+        }
+    }
+}
+
+pub fn apply_redo(client: &ReplayClient, edits: &Arc<Mutex<EditStack>>) {
+    let item = edits.lock().ok().and_then(|mut g| g.pop_redo());
+    let Some(item) = item else {
+        return;
+    };
+    match item {
+        Edit::Render(next) => {
+            if let Ok(cur) = client.render() {
+                if let Ok(mut g) = edits.lock() {
+                    g.push(Edit::Render(cur));
+                }
+            }
+            let _ = post_render(client, &next);
+            notify("League Director", "Redo look");
+        }
+        Edit::Sequence(next) => {
+            let _ = client.set_sequence(&next);
+        }
+    }
+}
+
+fn post_render(client: &ReplayClient, render: &Render) -> crate::api::error::Result<()> {
+    let body = serde_json::to_value(render).unwrap_or(json!({}));
+    client.set_render(&body)
+}
+
+fn maybe_fire(
+    action: Action,
+    client: &ReplayClient,
+    tx: &mpsc::Sender<HotkeyNews>,
+    edits: &Arc<Mutex<EditStack>>,
+) {
     if !should_arm(&frontmost_display_name()) {
         return;
     }
-    fire(action, client);
+    fire(action, client, edits);
     let _ = tx.send(HotkeyNews::Fired(action));
 }
 
-fn poll_loop(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsMap>>) {
+fn poll_loop(
+    tx: mpsc::Sender<HotkeyNews>,
+    bindings: Arc<Mutex<BindingsMap>>,
+    edits: Arc<Mutex<EditStack>>,
+) {
     let client = match ReplayClient::new() {
         Ok(c) => c,
         Err(_) => return,
@@ -132,7 +221,7 @@ fn poll_loop(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsMap>>) {
             let down = chord_held(chord, cmd, shift, alt, ctrl);
             let was = prev.get(action).copied().unwrap_or(false);
             if down && !was {
-                maybe_fire(*action, &client, &tx);
+                maybe_fire(*action, &client, &tx, &edits);
             }
             prev.insert(*action, down);
         }
@@ -254,7 +343,11 @@ const KCG_ALT: u64 = 0x0008_0000;
 const KCG_CMD: u64 = 0x0010_0000;
 
 #[cfg(target_os = "macos")]
-fn install_event_tap(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsMap>>) -> bool {
+fn install_event_tap(
+    tx: mpsc::Sender<HotkeyNews>,
+    bindings: Arc<Mutex<BindingsMap>>,
+    edits: Arc<Mutex<EditStack>>,
+) -> bool {
     permissions::request_hotkey_permissions();
     let Ok(client) = ReplayClient::new() else {
         return false;
@@ -263,6 +356,8 @@ fn install_event_tap(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsM
         tx,
         bindings,
         client,
+        edits,
+        tap: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
     });
     let info = Box::into_raw(ctx) as *mut c_void;
     let mask: u64 = 1u64 << KCG_EVENT_KEY_DOWN;
@@ -279,6 +374,7 @@ fn install_event_tap(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsM
             let _ = Box::from_raw(info as *mut TapCtx);
             return false;
         }
+        (*info.cast::<TapCtx>()).tap.store(tap, std::sync::atomic::Ordering::SeqCst);
         let src = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
         if src.is_null() {
             CFRelease(tap);
@@ -293,7 +389,11 @@ fn install_event_tap(tx: mpsc::Sender<HotkeyNews>, bindings: Arc<Mutex<BindingsM
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_event_tap(_tx: mpsc::Sender<HotkeyNews>, _bindings: Arc<Mutex<BindingsMap>>) -> bool {
+fn install_event_tap(
+    _tx: mpsc::Sender<HotkeyNews>,
+    _bindings: Arc<Mutex<BindingsMap>>,
+    _edits: Arc<Mutex<EditStack>>,
+) -> bool {
     false
 }
 
@@ -304,7 +404,20 @@ unsafe extern "C" fn tap_callback(
     event: *mut c_void,
     info: *mut c_void,
 ) -> *mut c_void {
-    if ty != KCG_EVENT_KEY_DOWN || event.is_null() || info.is_null() {
+    const TAP_DISABLED_TIMEOUT: u32 = 0xFFFF_FFFE;
+    const TAP_DISABLED_USER: u32 = 0xFFFF_FFFD;
+    if info.is_null() {
+        return event;
+    }
+    let ctx = unsafe { &*(info as *const TapCtx) };
+    if ty == TAP_DISABLED_TIMEOUT || ty == TAP_DISABLED_USER {
+        let tap = ctx.tap.load(std::sync::atomic::Ordering::SeqCst);
+        if !tap.is_null() {
+            unsafe { CGEventTapEnable(tap, true) };
+        }
+        return event;
+    }
+    if ty != KCG_EVENT_KEY_DOWN || event.is_null() {
         return event;
     }
     let repeat = unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_AUTOREPEAT) };
@@ -313,7 +426,6 @@ unsafe extern "C" fn tap_callback(
     }
     let code = unsafe { CGEventGetIntegerValueField(event, KCG_KEYBOARD_EVENT_KEYCODE) } as u16;
     let flags = unsafe { CGEventGetFlags(event) };
-    let ctx = unsafe { &*(info as *const TapCtx) };
     let map = ctx.bindings.lock().ok().map(|g| g.clone()).unwrap_or_default();
     let cmd = flags & KCG_CMD != 0;
     let shift = flags & KCG_SHIFT != 0;
@@ -323,7 +435,10 @@ unsafe extern "C" fn tap_callback(
         let chord = bindings::chord_of(&map, *action);
         if chord.key == code && chord.cmd == cmd && chord.shift == shift && chord.alt == alt && chord.ctrl == ctrl
         {
-            maybe_fire(*action, &ctx.client, &ctx.tx);
+            let client = ctx.client.clone();
+            let tx = ctx.tx.clone();
+            let edits = Arc::clone(&ctx.edits);
+            thread::spawn(move || maybe_fire(*action, &client, &tx, &edits));
             break;
         }
     }
