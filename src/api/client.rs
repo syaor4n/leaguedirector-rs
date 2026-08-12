@@ -103,7 +103,6 @@ impl ReplayClient {
         self.post("/replay/particles", &serde_json::Value::Object(map))
     }
 
-    #[allow(dead_code)]
     pub fn sequence(&self) -> Result<Sequence> {
         self.get("/replay/sequence")
     }

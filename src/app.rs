@@ -440,8 +440,21 @@ impl DirectorApp {
                 }
             }
         }
-        while let Some(k) = self.hotkeys.try_recv() {
-            self.apply_action(k);
+        while let Some(news) = self.hotkeys.try_recv() {
+            match news {
+                crate::hotkeys::HotkeyNews::Fired(action) => {
+                    self.last_hotkey = format!(
+                        "{} @ {}",
+                        action.label(),
+                        Playback::format_time(self.playback.time)
+                    );
+                    self.status = format!("Hotkey · {}", self.last_hotkey);
+                }
+                crate::hotkeys::HotkeyNews::TapFailed => {
+                    self.status = "Hotkeys: grant Accessibility + Input Monitoring to League Director.app, then restart it.".into();
+                    permissions::open_privacy_settings();
+                }
+            }
         }
     }
 
