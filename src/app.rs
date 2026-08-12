@@ -451,8 +451,8 @@ impl DirectorApp {
                     self.status = format!("Hotkey · {}", self.last_hotkey);
                 }
                 crate::hotkeys::HotkeyNews::TapFailed => {
-                    self.status = "Hotkeys: grant Accessibility + Input Monitoring to League Director.app, then restart it.".into();
-                    permissions::open_privacy_settings();
+                    self.status = "Hotkeys need permission. Click Grant — macOS will name League Director.".into();
+                    permissions::request_hotkey_permissions();
                 }
             }
         }
@@ -694,8 +694,8 @@ impl eframe::App for DirectorApp {
                     if ui.button("Files & Folders").clicked() {
                         permissions::open_files_privacy();
                     }
-                    if ui.button("Accessibility").clicked() {
-                        permissions::open_privacy_settings();
+                    if ui.button("Grant keys").clicked() {
+                        permissions::request_hotkey_permissions();
                     }
                     if ui.button("Refresh").clicked() {
                         self.installs = detect::find_installs();
@@ -751,11 +751,21 @@ impl DirectorApp {
     fn ui_connect(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("macOS permissions").strong());
         perm_row(ui, "Accessibility (global hotkeys)", self.perm_ax, || {
-            permissions::open_privacy_settings();
+            permissions::request_hotkey_permissions();
         });
         perm_row(ui, "Input Monitoring (read keys in League)", self.perm_input, || {
-            permissions::open_privacy_settings();
+            permissions::request_hotkey_permissions();
         });
+        if !self.perm_ax || !self.perm_input {
+            ui.label(
+                RichText::new("Grant names this app. After you allow, restart League Director.")
+                    .small()
+                    .weak(),
+            );
+            if ui.small_button("Open Settings only if the prompt did not appear").clicked() {
+                permissions::open_privacy_settings();
+            }
+        }
         perm_row(ui, "Documents / Files and Folders", self.perm_docs, || {
             permissions::open_files_privacy();
         });

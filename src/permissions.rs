@@ -57,12 +57,39 @@ pub fn input_monitoring_ok() -> bool {
     unsafe { CGPreflightListenEventAccess() }
 }
 
+/// System dialogs that name *this* app (League Director), not the generic
+/// Settings picker. `open_privacy_settings()` is a last-resort fallback.
 #[cfg(target_os = "macos")]
 pub fn request_hotkey_permissions() {
     unsafe {
-        let opts = std::ptr::null();
-        AXIsProcessTrustedWithOptions(opts);
+        prompt_accessibility();
         let _ = CGRequestListenEventAccess();
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn prompt_accessibility() {
+    let key = unsafe { kAXTrustedCheckOptionPrompt };
+    let val = unsafe { kCFBooleanTrue };
+    if key.is_null() || val.is_null() {
+        unsafe { AXIsProcessTrustedWithOptions(std::ptr::null()) };
+        return;
+    }
+    let keys = [key];
+    let vals = [val];
+    let dict = unsafe {
+        CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            vals.as_ptr(),
+            1,
+            std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks),
+            std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks),
+        )
+    };
+    unsafe { AXIsProcessTrustedWithOptions(dict) };
+    if !dict.is_null() {
+        unsafe { CFRelease(dict as *mut std::ffi::c_void) };
     }
 }
 
@@ -133,6 +160,7 @@ pub fn install_to_applications() -> Result<PathBuf, String> {
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
 }
@@ -142,4 +170,33 @@ extern "C" {
 extern "C" {
     fn CGPreflightListenEventAccess() -> bool;
     fn CGRequestListenEventAccess() -> bool;
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CFDictionaryKeyCallBacks {
+    _private: [u8; 48],
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CFDictionaryValueCallBacks {
+    _private: [u8; 40],
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFBooleanTrue: *const std::ffi::c_void;
+    static kCFTypeDictionaryKeyCallBacks: CFDictionaryKeyCallBacks;
+    static kCFTypeDictionaryValueCallBacks: CFDictionaryValueCallBacks;
+    fn CFDictionaryCreate(
+        allocator: *const std::ffi::c_void,
+        keys: *const *const std::ffi::c_void,
+        values: *const *const std::ffi::c_void,
+        num_values: isize,
+        key_call_backs: *const CFDictionaryKeyCallBacks,
+        value_call_backs: *const CFDictionaryValueCallBacks,
+    ) -> *const std::ffi::c_void;
+    fn CFRelease(cf: *mut std::ffi::c_void);
 }
