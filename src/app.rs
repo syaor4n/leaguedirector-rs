@@ -227,6 +227,9 @@ impl DirectorApp {
             return;
         }
         self.last_poll = Instant::now();
+        self.perm_ax = permissions::accessibility_trusted();
+        self.perm_input = permissions::input_monitoring_ok();
+        self.perm_docs = permissions::documents_ok();
         match self.client.game() {
             Ok(_) => {
                 self.connected = true;
@@ -712,7 +715,15 @@ impl eframe::App for DirectorApp {
                     Color32::from_rgb(220, 120, 80)
                 };
                 ui.label(RichText::new(&self.status).color(color));
-                ui.label(RichText::new(crate::hotkeys::debug_snapshot()).small().weak());
+                ui.label(
+                    RichText::new(if crate::hotkeys::tap_is_live() {
+                        "keys: on"
+                    } else {
+                        "keys: off"
+                    })
+                    .small()
+                    .weak(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.selectable_label(self.settings.show_hud, "HUD").clicked() {
                         self.settings.show_hud = !self.settings.show_hud;
@@ -1799,10 +1810,23 @@ impl DirectorApp {
                     self.reset_look();
                 }
             });
-            ui.label(RichText::new(crate::hotkeys::debug_snapshot()).small());
-            if !self.last_hotkey.is_empty() {
-                ui.label(RichText::new(&self.last_hotkey).small().color(Color32::from_rgb(80, 200, 140)));
-            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(if crate::hotkeys::tap_is_live() {
+                        "keys on"
+                    } else {
+                        "keys off — Grant keys"
+                    })
+                    .small(),
+                );
+                if !self.last_hotkey.is_empty() {
+                    ui.label(
+                        RichText::new(&self.last_hotkey)
+                            .small()
+                            .color(Color32::from_rgb(80, 200, 140)),
+                    );
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label(format!(
                     "{} / {}   {}",

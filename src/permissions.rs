@@ -44,6 +44,9 @@ pub fn open_folder(path: &Path) {
 
 #[cfg(target_os = "macos")]
 pub fn accessibility_trusted() -> bool {
+    if crate::hotkeys::tap_is_live() {
+        return true;
+    }
     unsafe { AXIsProcessTrusted() }
 }
 
@@ -54,6 +57,9 @@ pub fn accessibility_trusted() -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn input_monitoring_ok() -> bool {
+    if crate::hotkeys::tap_is_live() {
+        return true;
+    }
     unsafe { CGPreflightListenEventAccess() }
 }
 

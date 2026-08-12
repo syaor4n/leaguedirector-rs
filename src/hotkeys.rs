@@ -5,9 +5,16 @@ use crate::permissions;
 use serde_json::json;
 use std::collections::HashMap;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+static TAP_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn tap_is_live() -> bool {
+    TAP_LIVE.load(Ordering::Relaxed)
+}
 
 pub type BindingsMap = std::collections::BTreeMap<String, String>;
 
@@ -320,6 +327,7 @@ pub fn should_arm(front: &str) -> bool {
     crate::detect::game_pid().is_some() && !is_blocked_desktop(front)
 }
 
+#[allow(dead_code)]
 pub fn debug_snapshot() -> String {
     let front = frontmost_display_name();
     format!(
@@ -383,7 +391,9 @@ fn install_event_tap(
         }
         CFRunLoopAddSource(CFRunLoopGetCurrent(), src, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
+        TAP_LIVE.store(true, Ordering::Relaxed);
         CFRunLoopRun();
+        TAP_LIVE.store(false, Ordering::Relaxed);
     }
     true
 }
