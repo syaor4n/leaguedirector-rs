@@ -1,0 +1,29 @@
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>League Director lists your .rofl replays and writes webm captures under Documents.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>League Director can open a replay or capture stored on the Desktop.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>League Director can open a downloaded replay.</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>League Director talks to the League client to start a replay.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Global shortcuts (Space, K, arrows) need to read the keyboard while League is frontmost.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>League of Legends Replay</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>rofl</string>
+      </array>
+    </dict>
+  </array>

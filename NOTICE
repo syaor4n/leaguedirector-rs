@@ -1,0 +1,9 @@
+League Director (Rust)
+Copyright of original Python implementation: Riot Games, Inc.
+This project is an independent Apache-2.0 rewrite. It is not endorsed by Riot Games
+and does not reflect the views of anyone officially involved in producing or managing
+Riot Games properties. Riot Games and all associated properties are trademarks or
+registered trademarks of Riot Games, Inc.
+
+Portions of the design and Replay API field map are derived from
+https://github.com/RiotGames/leaguedirector (Apache License 2.0).

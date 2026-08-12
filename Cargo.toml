@@ -1,0 +1,31 @@
+[package]
+name = "leaguedirector"
+version = "0.3.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Native League of Legends Replay API director (Rust rewrite)"
+repository = "https://github.com/syaor4n/leaguedirector-rs"
+readme = "README.md"
+authors = ["League Director contributors"]
+
+[dependencies]
+eframe = "0.32"
+egui = "0.32"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+directories = "6"
+rfd = "0.15"
+thiserror = "2"
+
+[package.metadata.bundle]
+name = "League Director"
+identifier = "dev.leaguedirector.app"
+icon = ["assets/icon.icns"]
+version = "0.3.0"
+copyright = "Apache-2.0. Not endorsed by Riot Games."
+category = "public.app-category.video"
+short_description = "Stage and record League of Legends replays"
+osx_minimum_system_version = "11.0"
+osx_info_plist_exts = ["assets/Info.plist.ext"]
+resources = ["assets/skyboxes"]
