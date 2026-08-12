@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// If League left a `.webm.tmp`, remux it to a playable `.webm` next to it
 /// (and copy into `dest_dir` if different).
@@ -70,13 +70,83 @@ pub fn spawn_watchdog(
     hint: String,
     dest_dir: String,
     expected_secs: f64,
-    on_done: impl FnOnce(Option<PathBuf>) + Send + 'static,
+    on_done: impl FnOnce(Option<PathBuf>, Option<f64>) + Send + 'static,
 ) {
     thread::spawn(move || {
-        let wait = (expected_secs + 5.0).clamp(3.0, 180.0);
-        thread::sleep(Duration::from_secs_f64(wait));
-        on_done(finalize_recording(&hint, &dest_dir));
+        let min_wait = expected_secs.max(1.0);
+        thread::sleep(Duration::from_secs_f64(min_wait));
+        // Wait until the newest capture file stops growing (encode often outlives the API).
+        let deadline = Instant::now() + Duration::from_secs_f64((expected_secs + 45.0).clamp(8.0, 180.0));
+        let mut last_size = 0u64;
+        let mut stable = 0u8;
+        while Instant::now() < deadline {
+            let size = newest_capture_size(&hint, &dest_dir).unwrap_or(0);
+            if size > 0 && size == last_size {
+                stable += 1;
+                if stable >= 3 {
+                    break;
+                }
+            } else {
+                stable = 0;
+                last_size = size;
+            }
+            thread::sleep(Duration::from_millis(700));
+        }
+        let path = finalize_recording(&hint, &dest_dir);
+        let secs = path.as_ref().and_then(|p| probe_duration(p));
+        on_done(path, secs);
     });
+}
+
+fn newest_capture_size(hint: &str, dest_dir: &str) -> Option<u64> {
+    let mut dirs = vec![Path::new(hint).parent().unwrap_or(Path::new(".")).to_path_buf()];
+    if !dest_dir.is_empty() {
+        dirs.push(PathBuf::from(dest_dir));
+    }
+    let mut best: Option<(std::time::SystemTime, u64)> = None;
+    for dir in dirs {
+        let Ok(rd) = fs::read_dir(dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !(name.ends_with(".webm") || name.ends_with(".webm.tmp") || name.ends_with(".png")) {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else {
+                continue;
+            };
+            let Ok(t) = meta.modified() else {
+                continue;
+            };
+            let sz = meta.len();
+            if best.as_ref().map(|(ot, _)| t > *ot).unwrap_or(true) {
+                best = Some((t, sz));
+            }
+        }
+    }
+    best.map(|(_, s)| s)
+}
+
+pub fn probe_duration(path: &Path) -> Option<f64> {
+    let ff = ffmpeg_bin()?;
+    // ffprobe may not be bundled; use ffmpeg -i and parse Duration.
+    let out = Command::new(&ff)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stderr);
+    for part in text.split("Duration:") {
+        let token = part.split(',').next()?.trim();
+        let mut hms = token.split(':');
+        let h: f64 = hms.next()?.parse().ok()?;
+        let m: f64 = hms.next()?.parse().ok()?;
+        let s: f64 = hms.next()?.parse().ok()?;
+        return Some(h * 3600.0 + m * 60.0 + s);
+    }
+    None
 }
 
 pub fn ffmpeg_bin() -> Option<PathBuf> {

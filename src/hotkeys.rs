@@ -118,6 +118,7 @@ mod tests {
     #[test]
     fn matches_game_not_client() {
         assert!(is_league_name(r#""LSDisplayName"="League of Legends""#));
+        assert!(is_league_name(r#""LSDisplayName"="League Of Legends""#));
         assert!(!is_league_name(r#""LSDisplayName"="LeagueClient""#));
         assert!(!is_league_name(r#""LSDisplayName"="Riot Client""#));
         assert!(!is_league_name(r#""LSDisplayName"="Discord""#));

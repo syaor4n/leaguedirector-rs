@@ -107,6 +107,12 @@ impl Lcu {
             .ok()
             .and_then(|v| v.as_str().map(|s| s.to_string()))
     }
+
+    pub fn playing_replay(&self) -> Option<bool> {
+        self.get("/lol-replays/v1/configuration")
+            .ok()
+            .and_then(|v| v.get("isPlayingReplay").and_then(|x| x.as_bool()))
+    }
 }
 
 pub fn game_id_from_rofl(path: &Path) -> Option<u64> {

@@ -3,6 +3,7 @@ use crate::api::{
 };
 use crate::bindings::{self, Action};
 use crate::detect::{self, GameInstall};
+use crate::handshake::{self, WatchOutcome};
 use crate::hotkeys::HotkeyBus;
 use crate::lcu;
 use crate::media;
@@ -19,8 +20,8 @@ use std::time::{Duration, Instant};
 
 enum BgEvent {
     Status(String),
-    RoflOpened(PathBuf),
-    ClipReady(PathBuf),
+    WatchDone(WatchOutcome),
+    ClipReady { path: PathBuf, secs: Option<f64> },
 }
 
 pub struct DirectorApp {
@@ -62,6 +63,13 @@ pub struct DirectorApp {
     perm_input: bool,
     perm_docs: bool,
     from_bundle: bool,
+    lcu_ok: bool,
+    game_ok: bool,
+    api_ok: bool,
+    handshake_log: String,
+    pending_rofl: Option<PathBuf>,
+    rec_blocked: bool,
+    last_clip_secs: Option<f64>,
 }
 
 impl DirectorApp {
@@ -124,6 +132,13 @@ impl DirectorApp {
             perm_input: permissions::input_monitoring_ok(),
             perm_docs: permissions::documents_ok(),
             from_bundle: permissions::running_from_bundle(),
+            lcu_ok: false,
+            game_ok: detect::game_pid().is_some(),
+            api_ok: false,
+            handshake_log: String::new(),
+            pending_rofl: None,
+            rec_blocked: false,
+            last_clip_secs: None,
         }
     }
 
@@ -132,31 +147,68 @@ impl DirectorApp {
             return;
         }
         self.last_lcu_check = Instant::now();
-        self.lcu_line = match lcu::Lcu::connect() {
-            Ok(c) => match c.replay_path() {
-                Some(p) => format!("LCU connected · {p}"),
-                None => "LCU connected.".into(),
-            },
-            Err(_) => "LCU not found (open the League client to watch a replay).".into(),
-        };
+        self.game_ok = detect::game_pid().is_some();
+        match lcu::Lcu::connect() {
+            Ok(c) => {
+                self.lcu_ok = true;
+                let path = c.replay_path().unwrap_or_default();
+                let playing = c.playing_replay().unwrap_or(false);
+                self.lcu_line = if path.is_empty() {
+                    format!("LCU up · playing_replay={playing}")
+                } else {
+                    format!("LCU up · playing_replay={playing} · {path}")
+                };
+            }
+            Err(_) => {
+                self.lcu_ok = false;
+                self.lcu_line = "LCU not found (open the League client to watch a replay).".into();
+            }
+        }
     }
 
     fn drain_bg(&mut self) {
         while let Ok(ev) = self.bg_rx.try_recv() {
             match ev {
                 BgEvent::Status(s) => {
-                    self.lcu_busy = false;
                     self.status = s;
                 }
-                BgEvent::RoflOpened(path) => {
+                BgEvent::WatchDone(out) => {
                     self.lcu_busy = false;
-                    self.status = format!("Replay requested: {}", path.display());
                     self.rofls = detect::list_rofls();
+                    self.handshake_log = handshake::format_outcome(&out);
+                    match out {
+                        WatchOutcome::Ready { pid } => {
+                            self.game_ok = true;
+                            self.api_ok = true;
+                            self.rec_blocked = false;
+                            self.status = format!("Replay API up (pid {pid}).");
+                        }
+                        WatchOutcome::Crashed { .. } => {
+                            self.game_ok = false;
+                            self.api_ok = false;
+                            self.status = "Game launched then crashed before Replay API. See log below.".into();
+                        }
+                        WatchOutcome::Timeout { .. } => {
+                            self.status = "Timed out waiting for Replay API.".into();
+                        }
+                    }
                 }
-                BgEvent::ClipReady(path) => {
-                    self.status = format!("Capture ready: {}", path.display());
+                BgEvent::ClipReady { path, secs } => {
                     self.last_capture = Some(path.clone());
+                    self.last_clip_secs = secs;
                     self.settings.remember_clip(&path);
+                    if let Some(s) = secs {
+                        if s < 1.0 {
+                            self.status = format!(
+                                "Capture short ({s:.2}s) — encode likely truncated: {}",
+                                path.display()
+                            );
+                        } else {
+                            self.status = format!("Capture ready ({s:.2}s): {}", path.display());
+                        }
+                    } else {
+                        self.status = format!("Capture ready: {}", path.display());
+                    }
                 }
             }
         }
@@ -175,6 +227,8 @@ impl DirectorApp {
         match self.client.game() {
             Ok(_) => {
                 self.connected = true;
+                self.api_ok = true;
+                self.rec_blocked = false;
                 if let Ok(p) = self.client.playback() {
                     self.playback = p;
                     if self.rec_end <= 0.1 {
@@ -214,16 +268,33 @@ impl DirectorApp {
             }
             Err(_) => {
                 self.connected = false;
-                if self.was_recording {
+                self.api_ok = false;
+                self.game_ok = detect::game_pid().is_some();
+                if self.was_recording || self.rec_blocked {
+                    self.rec_blocked = true;
                     if let Some(path) =
                         media::finalize_recording(&self.recording.path, &self.settings.record_dir)
                     {
                         self.last_capture = Some(path.clone());
-                        self.status = format!("API dropped, remuxed: {}", path.display());
+                        self.settings.remember_clip(&path);
+                        self.status = format!(
+                            "API down after record — remuxed {}. Do not Watch until Recover.",
+                            path.display()
+                        );
+                    } else if !self.lcu_busy {
+                        self.status = "API down after record. Wait or Recover — do not Watch yet.".into();
                     }
                     self.was_recording = false;
-                } else if !self.lcu_busy {
-                    self.status = "Replay API idle — open a .rofl or start a replay.".into();
+                } else if self.lcu_busy {
+                    self.status = if self.game_ok {
+                        "Game starting… waiting for Replay API (warmup 404s are normal).".into()
+                    } else {
+                        "LCU watch sent — waiting for LeagueofLegends process…".into()
+                    };
+                } else if self.game_ok {
+                    self.status = "Game process is up, Replay API not ready yet…".into();
+                } else {
+                    self.status = "Replay API idle — Watch a .rofl or start a replay.".into();
                 }
             }
         }
@@ -340,7 +411,7 @@ impl DirectorApp {
             Action::RecordToggle => {
                 if self.recording.recording {
                     let _ = self.client.set_recording(&serde_json::json!({ "recording": false }));
-                } else if self.connected {
+                } else if self.can_record() {
                     let start = self.playback.time;
                     self.start_recording(start, (start + 8.0).min(self.playback.length.max(start + 0.5)));
                 }
@@ -390,6 +461,12 @@ impl DirectorApp {
         }
         for (i, k) in self.sequence.depth_of_field_enabled.iter().enumerate() {
             v.push((TrackId::Dof, i, k.time));
+        }
+        for (i, k) in self.sequence.skybox_rotation.iter().enumerate() {
+            v.push((TrackId::Sky, i, k.time));
+        }
+        for (i, k) in self.sequence.near_clip.iter().enumerate() {
+            v.push((TrackId::Near, i, k.time));
         }
         v.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         v
@@ -457,18 +534,55 @@ impl DirectorApp {
                     self.sequence.depth_of_field_enabled.remove(index);
                 }
             }
+            TrackId::Sky => {
+                if index < self.sequence.skybox_rotation.len() {
+                    self.sequence.skybox_rotation.remove(index);
+                }
+            }
+            TrackId::Near => {
+                if index < self.sequence.near_clip.len() {
+                    self.sequence.near_clip.remove(index);
+                }
+            }
         }
         self.selected_kf = None;
         self.push_sequence();
     }
 
+    fn can_record(&self) -> bool {
+        self.connected && !self.recording.recording && !self.rec_blocked && !self.lcu_busy
+    }
+
     fn open_rofl(&mut self, path: PathBuf) {
+        if self.rec_blocked {
+            self.status = "API still down after a recording. Recover first, then Watch.".into();
+            return;
+        }
         self.lcu_busy = true;
-        self.status = format!("Opening {}…", path.display());
+        self.pending_rofl = Some(path.clone());
+        self.handshake_log.clear();
+        self.status = format!("Watch sent — waiting for game + Replay API ({})…", path.display());
         spawn_watch(self.bg_tx.clone(), path);
     }
 
+    fn recover_after_record(&mut self) {
+        if let Some(path) =
+            media::finalize_recording(&self.recording.path, &self.settings.record_dir)
+        {
+            self.last_capture = Some(path.clone());
+            self.settings.remember_clip(&path);
+            self.last_clip_secs = media::probe_duration(&path);
+        }
+        self.rec_blocked = false;
+        self.was_recording = false;
+        self.status = "Recovered remux. If the game is dead, Watch again after a few seconds.".into();
+    }
+
     fn start_recording(&mut self, start: f64, end: f64) {
+        if !self.can_record() {
+            self.status = "Cannot record: need a live Replay API and no previous hung encode.".into();
+            return;
+        }
         let _ = std::fs::create_dir_all(&self.settings.record_dir);
         if self.apply_sequence {
             self.push_sequence();
@@ -505,9 +619,9 @@ impl DirectorApp {
             }
         });
         let tx2 = self.bg_tx.clone();
-        media::spawn_watchdog(hint, dest, span, move |maybe| {
+        media::spawn_watchdog(hint, dest, span, move |maybe, secs| {
             if let Some(p) = maybe {
-                let _ = tx2.send(BgEvent::ClipReady(p));
+                let _ = tx2.send(BgEvent::ClipReady { path: p, secs });
             }
         });
     }
@@ -525,11 +639,12 @@ impl eframe::App for DirectorApp {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("director_hud"),
                 egui::ViewportBuilder::default()
-                    .with_title("Director HUD")
+                    .with_title("Director")
                     .with_inner_size([460.0, 92.0])
                     .with_min_inner_size([320.0, 72.0])
                     .with_always_on_top()
-                    .with_maximize_button(false),
+                    .with_maximize_button(false)
+                    .with_close_button(true),
                 |ctx, class| {
                     let _ = class;
                     self.ui_hud(ctx);
@@ -653,6 +768,32 @@ impl DirectorApp {
                     .weak(),
             );
         });
+        ui.separator();
+        ui.label(RichText::new("Live status").strong());
+        perm_row(ui, "LCU (League client lockfile)", self.lcu_ok, || {});
+        perm_row(ui, "LeagueofLegends process", self.game_ok, || {});
+        perm_row(ui, "Replay API https://127.0.0.1:2999", self.api_ok, || {});
+        if self.rec_blocked {
+            ui.colored_label(
+                Color32::from_rgb(220, 120, 80),
+                "Recording blocked: last encode killed the API. Recover before Watch.",
+            );
+            if ui.button("Recover remux").clicked() {
+                self.recover_after_record();
+            }
+        }
+        if !self.handshake_log.is_empty() {
+            ui.collapsing("Last watch handshake", |ui| {
+                ui.label(RichText::new(&self.handshake_log).small().monospace());
+            });
+            if !self.api_ok {
+                if ui.button("Retry last .rofl").clicked() {
+                    if let Some(p) = self.pending_rofl.clone().or_else(|| self.selected_rofl.clone()) {
+                        self.open_rofl(p);
+                    }
+                }
+            }
+        }
         ui.separator();
         ui.label("1. Tick an install to write EnableReplayApi=1 into game.cfg.");
         ui.label("2. Open a .rofl here (copied into League Replays + LCU watch) — do not pass it as argv.");
@@ -1397,7 +1538,24 @@ impl DirectorApp {
                 "ffmpeg not found — .webm.tmp remux will be a raw copy.",
             );
         }
-        ui.add_enabled_ui(self.connected && !self.recording.recording, |ui| {
+        if self.rec_blocked {
+            ui.colored_label(
+                Color32::YELLOW,
+                "Previous encode dropped the Replay API. Recover before recording again.",
+            );
+            if ui.button("Recover remux").clicked() {
+                self.recover_after_record();
+            }
+        }
+        if let Some(secs) = self.last_clip_secs {
+            if secs < 1.0 {
+                ui.colored_label(
+                    Color32::YELLOW,
+                    format!("Last clip is only {secs:.2}s — League likely truncated the encode."),
+                );
+            }
+        }
+        ui.add_enabled_ui(self.can_record(), |ui| {
             ui.horizontal(|ui| {
                 ui.label("Folder");
                 ui.text_edit_singleline(&mut self.settings.record_dir);
@@ -1603,11 +1761,17 @@ impl DirectorApp {
 fn spawn_watch(tx: Sender<BgEvent>, path: PathBuf) {
     thread::spawn(move || {
         match lcu::Lcu::connect().and_then(|c| c.watch_rofl(&path)) {
-            Ok(dest) => {
-                let _ = tx.send(BgEvent::RoflOpened(dest));
+            Ok(_) => {
+                let _ = tx.send(BgEvent::Status(
+                    "LCU accepted watch — waiting for game process + Replay API…".into(),
+                ));
+                let out = handshake::await_replay(Duration::from_secs(50));
+                let _ = tx.send(BgEvent::WatchDone(out));
             }
             Err(e) => {
-                let _ = tx.send(BgEvent::Status(format!("LCU: {e}")));
+                let _ = tx.send(BgEvent::WatchDone(WatchOutcome::Timeout {
+                    log: format!("LCU: {e}"),
+                }));
             }
         }
     });

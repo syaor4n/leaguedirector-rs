@@ -1,6 +1,6 @@
 [package]
 name = "leaguedirector"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Native League of Legends Replay API director (Rust rewrite)"
@@ -22,7 +22,7 @@ thiserror = "2"
 name = "League Director"
 identifier = "dev.leaguedirector.app"
 icon = ["assets/icon.icns"]
-version = "0.4.0"
+version = "0.4.1"
 copyright = "Apache-2.0. Not endorsed by Riot Games."
 category = "public.app-category.video"
 short_description = "Stage and record League of Legends replays"

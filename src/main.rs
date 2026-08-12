@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod bindings;
 mod detect;
+mod handshake;
 mod hotkeys;
 mod lcu;
 mod media;

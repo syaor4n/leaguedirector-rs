@@ -9,6 +9,8 @@ pub enum TrackId {
     Speed,
     Fog,
     Dof,
+    Sky,
+    Near,
 }
 
 pub enum TrackEvent {
@@ -28,6 +30,8 @@ pub fn apply_move(sequence: &mut Sequence, track: TrackId, index: usize, time: f
         TrackId::Speed => set_time(&mut sequence.playback_speed, index, time),
         TrackId::Fog => set_time(&mut sequence.depth_fog_enabled, index, time),
         TrackId::Dof => set_time(&mut sequence.depth_of_field_enabled, index, time),
+        TrackId::Sky => set_time(&mut sequence.skybox_rotation, index, time),
+        TrackId::Near => set_time(&mut sequence.near_clip, index, time),
     }
 }
 
@@ -39,7 +43,7 @@ fn set_time<T>(frames: &mut [Keyframe<T>], index: usize, time: f64) {
 
 pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64) -> Option<TrackEvent> {
     let length = length.max(1.0);
-    let tracks: [(&str, TrackId, usize, Color32); 6] = [
+    let tracks: [(&str, TrackId, usize, Color32); 8] = [
         (
             "pos",
             TrackId::Position,
@@ -76,6 +80,18 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
             sequence.depth_of_field_enabled.len(),
             Color32::from_rgb(230, 200, 120),
         ),
+        (
+            "sky",
+            TrackId::Sky,
+            sequence.skybox_rotation.len(),
+            Color32::from_rgb(180, 160, 255),
+        ),
+        (
+            "near",
+            TrackId::Near,
+            sequence.near_clip.len(),
+            Color32::from_rgb(130, 220, 190),
+        ),
     ];
     let row_h = 22.0;
     let height = 12.0 + tracks.len() as f32 * row_h;
@@ -107,6 +123,8 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
             TrackId::Speed => sequence.playback_speed.iter().map(|k| k.time).collect(),
             TrackId::Fog => sequence.depth_fog_enabled.iter().map(|k| k.time).collect(),
             TrackId::Dof => sequence.depth_of_field_enabled.iter().map(|k| k.time).collect(),
+            TrackId::Sky => sequence.skybox_rotation.iter().map(|k| k.time).collect(),
+            TrackId::Near => sequence.near_clip.iter().map(|k| k.time).collect(),
         };
 
         for (ki, t) in times.iter().enumerate() {
@@ -117,11 +135,11 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
             let resp = ui.interact(hit, ui.id().with(("kf", *name, ki)), Sense::click_and_drag());
             if resp.dragged() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    let nt = ((pos.x - row.left()) / row.width()).clamp(0.0, 1.0) as f64 * length;
+                    let raw = ((pos.x - row.left()) / row.width()).clamp(0.0, 1.0) as f64 * length;
                     event = Some(TrackEvent::Move {
                         track: *id,
                         index: ki,
-                        time: nt,
+                        time: snap_time(raw, sequence, length),
                     });
                 }
             } else if resp.clicked() {
@@ -156,6 +174,30 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
         }
     }
     event
+}
+
+fn snap_time(t: f64, sequence: &Sequence, length: f64) -> f64 {
+    let mut t = (t * 20.0).round() / 20.0;
+    t = t.clamp(0.0, length);
+    let mut best = t;
+    let mut best_d = 0.12;
+    for k in sequence
+        .camera_position
+        .iter()
+        .map(|k| k.time)
+        .chain(sequence.camera_rotation.iter().map(|k| k.time))
+        .chain(sequence.field_of_view.iter().map(|k| k.time))
+        .chain(sequence.playback_speed.iter().map(|k| k.time))
+        .chain(sequence.skybox_rotation.iter().map(|k| k.time))
+        .chain(sequence.near_clip.iter().map(|k| k.time))
+    {
+        let d = (k - t).abs();
+        if d > 1e-3 && d < best_d {
+            best_d = d;
+            best = k;
+        }
+    }
+    best
 }
 
 pub fn keyframe_table_vec3(ui: &mut Ui, title: &str, frames: &mut Vec<Keyframe<Vec3>>) -> bool {

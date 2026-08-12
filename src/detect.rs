@@ -44,6 +44,68 @@ pub fn lol_dir_from_cfg(cfg: &Path) -> Option<PathBuf> {
     None
 }
 
+pub fn game_pid() -> Option<u32> {
+    let out = Command::new("pgrep").args(["-x", "LeagueofLegends"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.trim().parse().ok())
+}
+
+pub fn latest_r3dlog() -> Option<PathBuf> {
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for inst in find_installs() {
+        let Some(root) = lol_dir_from_cfg(&inst.cfg) else {
+            continue;
+        };
+        let logs = root.join("Logs/GameLogs");
+        let Ok(rd) = fs::read_dir(logs) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(inner) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for f in inner.flatten() {
+                let p = f.path();
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !name.ends_with("r3dlog.txt") {
+                    continue;
+                }
+                let modified = p.metadata().and_then(|m| m.modified()).ok();
+                if let Some(t) = modified {
+                    if newest.as_ref().map(|(ot, _)| t > *ot).unwrap_or(true) {
+                        newest = Some((t, p));
+                    }
+                }
+            }
+        }
+    }
+    newest.map(|(_, p)| p)
+}
+
+pub fn latest_r3dlog_tail(lines: usize) -> String {
+    let Some(path) = latest_r3dlog() else {
+        return "(no r3dlog found)".into();
+    };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return format!("(could not read {})", path.display());
+    };
+    let collected: Vec<&str> = text.lines().rev().take(lines).collect();
+    let mut out = format!("{}\n", path.display());
+    for line in collected.into_iter().rev() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 pub fn preferred_replay_dir() -> Option<PathBuf> {
     for inst in find_installs() {
         if let Some(root) = lol_dir_from_cfg(&inst.cfg) {

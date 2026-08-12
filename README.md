@@ -40,7 +40,8 @@ In System Settings, grant **League Director.app** (not `cargo`):
 
 1. `./scripts/macos-bundle.sh` then **Install to /Applications** (Connect tab), or copy the `.app` yourself.
 2. Open **that** app (not `cargo run`) and grant Accessibility, Input Monitoring, and Files and Folders.
-3. Tick your League install, Watch a `.rofl`, keep the HUD on top while filming.
+3. Tick your League install, Watch a `.rofl`. Director waits for the game process **and** `https://127.0.0.1:2999` (LCU 204 is not enough). If the game dies at loading, the Connect tab shows the r3dlog tail and Retry.
+4. Keep the HUD on top while filming. Do not start another recording while the API is down after an encode.
 
 Global hotkeys fire only while **League of Legends** (the game) is frontmost. Remap them in the Keys tab.
 
