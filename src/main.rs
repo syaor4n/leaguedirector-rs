@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod bindings;
+mod chrome;
 mod detect;
 mod edits;
 mod handshake;

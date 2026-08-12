@@ -2,6 +2,7 @@ use crate::api::{
     upsert_kf, Color, Playback, Particles, Recording, Render, ReplayClient, Sequence, Vec3,
 };
 use crate::bindings::{self, Action};
+use crate::chrome;
 use crate::detect::{self, GameInstall};
 use crate::handshake::{self, WatchOutcome};
 use crate::edits::{Edit, EditStack};
@@ -15,8 +16,6 @@ use crate::sequence_ui::{self, TrackEvent, TrackId};
 use crate::settings::Settings;
 use eframe::egui::{self, Color32, FontId, RichText, Slider, Ui};
 
-const COL_BG: Color32 = Color32::from_rgb(0x16, 0x16, 0x18);
-const COL_PANEL: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x22);
 const COL_LIVE: Color32 = Color32::from_rgb(0x3D, 0xCF, 0x8E);
 const COL_REC: Color32 = Color32::from_rgb(0xE2, 0x4B, 0x4A);
 const COL_AMBER: Color32 = Color32::from_rgb(0xE8, 0xA2, 0x3A);
@@ -767,23 +766,40 @@ impl eframe::App for DirectorApp {
                     }
                 });
             });
+            ui.add_space(6.0);
+            if let Some(i) = chrome::desk_switcher(ui, self.tab) {
+                self.tab = i;
+                self.settings.last_tab = i;
+                self.settings.save();
+            }
             ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                for (i, label) in ["Connect", "Look", "Cut", "Capture"].iter().enumerate() {
-                    let selected = self.tab == i;
-                    let text = if selected {
-                        RichText::new(*label).strong().color(COL_AMBER)
-                    } else {
-                        RichText::new(*label).color(COL_MUTE)
-                    };
-                    if ui.selectable_label(selected, text).clicked() {
-                        self.tab = i;
-                        self.settings.last_tab = i;
-                        self.settings.save();
-                    }
-                }
-            });
-            ui.add_space(4.0);
+        });
+
+        egui::TopBottomPanel::bottom("deck").exact_height(58.0).show(ctx, |ui| {
+            ui.set_min_width(ui.available_width());
+            let t = chrome::transport_bar(ui, &self.playback, self.recording.recording);
+            if t.play {
+                self.apply_action(Action::PlayPause);
+            }
+            if t.back {
+                self.apply_action(Action::SeekBack);
+            }
+            if t.fwd {
+                self.apply_action(Action::SeekFwd);
+            }
+            if t.key {
+                self.apply_action(Action::Keyframe);
+            }
+            if t.seq {
+                self.apply_action(Action::PlaySeq);
+            }
+            if t.rec {
+                self.apply_action(Action::RecordToggle);
+            }
+            if let Some(time) = t.seek {
+                self.post_playback(serde_json::json!({ "time": time, "paused": true }));
+                self.playback.time = time;
+            }
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
@@ -801,20 +817,30 @@ impl eframe::App for DirectorApp {
 
 impl DirectorApp {
     fn ui_look(&mut self, ui: &mut Ui) {
-        self.ui_timeline(ui);
-        ui.add_space(8.0);
-        ui.separator();
+        chrome::section(ui, "Look");
+        ui.label(
+            RichText::new("Transport lives on the deck at the bottom.")
+                .small()
+                .color(COL_MUTE),
+        );
+        ui.add_space(6.0);
         self.ui_render(ui);
     }
 
     fn ui_cut(&mut self, ui: &mut Ui) {
+        chrome::section(ui, "Cut");
         self.ui_sequence(ui);
         ui.add_space(8.0);
-        ui.collapsing("Visibility", |ui| self.ui_visibility(ui));
-        ui.collapsing("Particles", |ui| self.ui_particles(ui));
+        ui.collapsing(RichText::new("Visibility").color(COL_MUTE), |ui| {
+            self.ui_visibility(ui);
+        });
+        ui.collapsing(RichText::new("Particles").color(COL_MUTE), |ui| {
+            self.ui_particles(ui);
+        });
     }
 
     fn ui_capture(&mut self, ui: &mut Ui) {
+        chrome::section(ui, "Capture");
         self.ui_recording(ui);
     }
 
@@ -863,10 +889,17 @@ impl DirectorApp {
             }
             ui.separator();
         }
-        ui.label(RichText::new("Stage").strong());
-        perm_row(ui, "LCU (League client lockfile)", self.lcu_ok, || {});
-        perm_row(ui, "LeagueofLegends process", self.game_ok, || {});
-        perm_row(ui, "Replay API https://127.0.0.1:2999", self.api_ok, || {});
+        chrome::section(ui, "Stage");
+        ui.horizontal(|ui| {
+            chrome::lamp(ui, self.lcu_ok, "LCU");
+            ui.add_space(12.0);
+            chrome::lamp(ui, self.game_ok, "Game");
+            ui.add_space(12.0);
+            chrome::lamp(ui, self.api_ok, "API");
+        });
+        if !self.lcu_line.is_empty() {
+            ui.label(RichText::new(&self.lcu_line).small().color(COL_MUTE));
+        }
         if self.rec_blocked {
             ui.colored_label(
                 Color32::from_rgb(220, 120, 80),
@@ -912,9 +945,8 @@ impl DirectorApp {
         }
 
         ui.add_space(12.0);
-        ui.separator();
+        chrome::section(ui, "Replays");
         ui.horizontal(|ui| {
-            ui.heading("Replays");
             if ui.button("Scan").clicked() {
                 self.rofls = detect::list_rofls();
             }
@@ -924,30 +956,17 @@ impl DirectorApp {
                     self.open_rofl(path);
                 }
             }
-            if ui.button("Documents privacy").clicked() {
-                permissions::open_files_privacy();
-            }
             if let Some(dir) = detect::preferred_replay_dir() {
-                if ui.small_button("Open League Replays").clicked() {
+                if ui.small_button("Folder").clicked() {
                     permissions::open_folder(&dir);
                 }
             }
         });
-        ui.label(
-            RichText::new(
-                "On Mac, League mainly reads Contents/LoL/Replays. The app copies the file before watch.",
-            )
-            .small()
-            .weak(),
-        );
         if self.rofls.is_empty() {
-            ui.colored_label(
-                Color32::YELLOW,
-                "No .rofl visible. Allow Files and Folders, or pick a file.",
-            );
+            ui.colored_label(COL_AMBER, "No .rofl visible. Grant Files and Folders, or pick a file.");
         }
         egui::ScrollArea::vertical()
-            .max_height(280.0)
+            .max_height(320.0)
             .show(ui, |ui| {
                 for path in self.rofls.clone() {
                     let name = path
@@ -960,18 +979,14 @@ impl DirectorApp {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default();
                     let selected = self.selected_rofl.as_ref() == Some(&path);
-                    ui.horizontal(|ui| {
-                        if ui.selectable_label(selected, &name).clicked() {
-                            self.selected_rofl = Some(path.clone());
-                        }
-                        ui.label(RichText::new(parent).small().weak());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Watch").clicked() {
-                                self.selected_rofl = Some(path.clone());
-                                self.open_rofl(path.clone());
-                            }
-                        });
-                    });
+                    let (sel, watch) = chrome::replay_row(ui, &name, &parent, selected);
+                    if sel {
+                        self.selected_rofl = Some(path.clone());
+                    }
+                    if watch {
+                        self.selected_rofl = Some(path.clone());
+                        self.open_rofl(path.clone());
+                    }
                 }
             });
         if self.lcu_busy {
@@ -986,6 +1001,7 @@ impl DirectorApp {
         ui.collapsing("Key bindings", |ui| self.ui_keys(ui));
     }
 
+    #[allow(dead_code)]
     fn ui_timeline(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(self.connected, |ui| {
             ui.horizontal(|ui| {
@@ -1946,21 +1962,45 @@ fn map_desk(old: usize) -> usize {
 }
 
 fn apply_theme(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for path in [
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "deck_mono".into(),
+                egui::FontData::from_owned(bytes).into(),
+            );
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .insert(0, "deck_mono".into());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+
     let mut style = (*ctx.style()).clone();
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = COL_BG;
-    visuals.window_fill = COL_PANEL;
+    visuals.panel_fill = chrome::BG;
+    visuals.window_fill = chrome::PANEL;
     visuals.extreme_bg_color = Color32::from_rgb(0x12, 0x12, 0x14);
-    visuals.faint_bg_color = COL_PANEL;
-    visuals.override_text_color = Some(COL_TEXT);
-    visuals.widgets.noninteractive.fg_stroke.color = COL_MUTE;
+    visuals.faint_bg_color = chrome::PANEL;
+    visuals.override_text_color = Some(chrome::TEXT);
+    visuals.widgets.noninteractive.fg_stroke.color = chrome::MUTE;
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(0x28, 0x28, 0x2E);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x32, 0x32, 0x3A);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(0x32, 0x32, 0x38);
     visuals.widgets.active.bg_fill = Color32::from_rgb(0x3A, 0x32, 0x24);
-    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xE8, 0xA2, 0x3A, 60);
-    visuals.hyperlink_color = COL_AMBER;
-    visuals.warn_fg_color = COL_AMBER;
-    visuals.error_fg_color = COL_REC;
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(2);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(2);
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0xE8, 0xA2, 0x3A, 55);
+    visuals.hyperlink_color = chrome::AMBER;
+    visuals.warn_fg_color = chrome::AMBER;
+    visuals.error_fg_color = chrome::REC;
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.visuals = visuals;
     ctx.set_style(style);
