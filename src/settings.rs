@@ -12,6 +12,7 @@ pub struct Settings {
     pub show_hud: bool,
     pub sequence_dir: String,
     pub last_sequence: String,
+    pub last_look: String,
     pub bindings: BTreeMap<String, String>,
     pub clips: Vec<String>,
 }
@@ -24,6 +25,7 @@ impl Default for Settings {
             show_hud: true,
             sequence_dir: sequences_dir().display().to_string(),
             last_sequence: String::new(),
+            last_look: String::new(),
             bindings: bindings::default_map(),
             clips: Vec::new(),
         }

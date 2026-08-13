@@ -8,6 +8,7 @@ use crate::handshake::{self, WatchOutcome};
 use crate::edits::{Edit, EditStack};
 use crate::hotkeys::HotkeyBus;
 use crate::lcu;
+use crate::looks;
 use crate::media;
 use crate::permissions;
 use crate::presets;
@@ -79,6 +80,10 @@ pub struct DirectorApp {
     rec_blocked: bool,
     last_clip_secs: Option<f64>,
     last_hotkey: String,
+    clip_in: Option<f64>,
+    clip_out: Option<f64>,
+    look_name: String,
+    look_dragging: bool,
 }
 
 impl DirectorApp {
@@ -102,6 +107,7 @@ impl DirectorApp {
         }
         let bindings = settings.bindings.clone();
         let seq_name = settings.last_sequence.clone();
+        let look_name = settings.last_look.clone();
         let tab = map_desk(settings.last_tab);
         let edits = std::sync::Arc::new(std::sync::Mutex::new(EditStack::default()));
         Self {
@@ -150,6 +156,10 @@ impl DirectorApp {
             rec_blocked: false,
             last_clip_secs: None,
             last_hotkey: String::new(),
+            clip_in: None,
+            clip_out: None,
+            look_name,
+            look_dragging: false,
         }
     }
 
@@ -245,12 +255,11 @@ impl DirectorApp {
                 self.rec_blocked = false;
                 if let Ok(p) = self.client.playback() {
                     self.playback = p;
-                    if self.rec_end <= 0.1 {
-                        self.rec_end = self.playback.length;
-                    }
                 }
-                if let Ok(r) = self.client.render() {
-                    self.render = r;
+                if !self.look_dragging {
+                    if let Ok(r) = self.client.render() {
+                        self.render = r;
+                    }
                 }
                 if let Ok(r) = self.client.recording() {
                     self.recording = r;
@@ -412,7 +421,7 @@ impl DirectorApp {
             }
             Action::Keyframe => {
                 self.add_camera_keyframes();
-                self.tab = 4;
+                self.tab = 2;
                 self.status = format!("Keyframe · {}", self.last_hotkey);
                 crate::hotkeys::notify("League Director", "Keyframe");
             }
@@ -447,14 +456,7 @@ impl DirectorApp {
                 self.snapshot_render();
                 self.post_render(serde_json::json!({ "cameraAttached": !self.render.camera_attached }));
             }
-            Action::RecordToggle => {
-                if self.recording.recording {
-                    let _ = self.client.set_recording(&serde_json::json!({ "recording": false }));
-                } else if self.can_record() {
-                    let start = self.playback.time;
-                    self.start_recording(start, (start + 8.0).min(self.playback.length.max(start + 0.5)));
-                }
-            }
+            Action::RecordToggle => self.record_from_deck(),
             Action::Cinematic => {
                 self.snapshot_render();
                 let _ = self.client.set_render(&presets::cinematic());
@@ -619,17 +621,112 @@ impl DirectorApp {
         spawn_watch(self.bg_tx.clone(), path);
     }
 
+    fn clip_range(&self) -> (f64, f64) {
+        let len = self.playback.length.max(0.5);
+        let now = self.playback.time.clamp(0.0, len);
+        match (self.clip_in, self.clip_out) {
+            (Some(a), Some(b)) if (b - a).abs() >= 0.4 => {
+                if b >= a {
+                    (a, b.min(len))
+                } else {
+                    (b, a.min(len))
+                }
+            }
+            (Some(a), None) => (a.clamp(0.0, len), (a + 8.0).min(len).max(a + 0.5)),
+            (None, Some(b)) => ((b - 8.0).max(0.0), b.clamp(0.5, len)),
+            _ => (now, (now + 8.0).min(len).max(now + 0.5)),
+        }
+    }
+
+    fn apply_deck(&mut self, t: chrome::TransportOut) {
+        if t.play {
+            self.apply_action(Action::PlayPause);
+        }
+        if t.back {
+            self.apply_action(Action::SeekBack);
+        }
+        if t.fwd {
+            self.apply_action(Action::SeekFwd);
+        }
+        if t.key {
+            self.apply_action(Action::Keyframe);
+        }
+        if t.seq {
+            self.apply_action(Action::PlaySeq);
+        }
+        if t.rec {
+            self.record_from_deck();
+        }
+        if t.mark_in {
+            self.clip_in = Some(self.playback.time);
+            self.rec_start = self.playback.time;
+            self.status = format!("In {}", Playback::format_time(self.playback.time));
+        }
+        if t.mark_out {
+            self.clip_out = Some(self.playback.time);
+            self.rec_end = self.playback.time;
+            self.status = format!("Out {}", Playback::format_time(self.playback.time));
+        }
+        if t.clear_marks {
+            self.clip_in = None;
+            self.clip_out = None;
+            self.status = "In/Out cleared — Rec is playhead +8s.".into();
+        }
+        if t.undo {
+            self.undo();
+        }
+        if t.reset {
+            self.reset_look();
+        }
+        if let Some(time) = t.seek {
+            self.post_playback(serde_json::json!({ "time": time, "paused": true }));
+            self.playback.time = time;
+        }
+    }
+
+    fn record_from_deck(&mut self) {
+        if self.recording.recording {
+            let _ = self.client.set_recording(&serde_json::json!({ "recording": false }));
+            self.status = "Stopping encode…".into();
+            return;
+        }
+        if self.rec_blocked {
+            self.status = "Recording blocked — Recover remux first.".into();
+            return;
+        }
+        let (start, end) = self.clip_range();
+        self.start_recording(start, end);
+    }
+
     fn recover_after_record(&mut self) {
-        if let Some(path) =
-            media::finalize_recording(&self.recording.path, &self.settings.record_dir)
-        {
+        let hint = if !self.recording.path.is_empty() {
+            self.recording.path.clone()
+        } else {
+            media::leftover_tmp(&self.settings.record_dir)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        };
+        if let Some(path) = media::finalize_recording(&hint, &self.settings.record_dir) {
             self.last_capture = Some(path.clone());
             self.settings.remember_clip(&path);
             self.last_clip_secs = media::probe_duration(&path);
         }
-        self.rec_blocked = false;
         self.was_recording = false;
-        self.status = "Recovered remux. If the game is dead, Watch again after a few seconds.".into();
+        match self.client.game() {
+            Ok(_) => {
+                self.rec_blocked = false;
+                self.connected = true;
+                self.api_ok = true;
+                self.status = "Remuxed. Replay API is back — recording unlocked.".into();
+            }
+            Err(_) if detect::game_pid().is_none() => {
+                self.rec_blocked = false;
+                self.status = "Remuxed. Game is gone — Watch again when ready.".into();
+            }
+            Err(_) => {
+                self.status = "Remuxed. Game is up but API is still down — wait, do not Watch yet.".into();
+            }
+        }
     }
 
     fn start_recording(&mut self, start: f64, end: f64) {
@@ -637,6 +734,16 @@ impl DirectorApp {
             self.status = "Cannot record: need a live Replay API and no previous hung encode.".into();
             return;
         }
+        if self.client.game().is_err() {
+            self.status = "Replay API not ready — not starting encode.".into();
+            return;
+        }
+        let (start, end, clamped) = if self.rec_codec == "png" {
+            let (a, b) = if end >= start { (start, end) } else { (end, start) };
+            (a, b.max(a + 0.5), false)
+        } else {
+            media::clamp_webm_span(start, end)
+        };
         let _ = std::fs::create_dir_all(&self.settings.record_dir);
         if self.apply_sequence {
             self.push_sequence();
@@ -661,12 +768,20 @@ impl DirectorApp {
         self.rec_start = start;
         self.rec_end = end;
         self.was_recording = true;
-        self.status = format!("Recording → {}", path.display());
+        let span = (end - start).max(0.5);
+        self.status = if clamped {
+            format!(
+                "Recording {span:.1}s (clamped to {}s webm) → {}",
+                media::MAX_WEBM_SECS,
+                path.display()
+            )
+        } else {
+            format!("Recording {span:.1}s → {}", path.display())
+        };
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         let hint = path.display().to_string();
         let dest = self.settings.record_dir.clone();
-        let span = (end - start).max(0.5);
         thread::spawn(move || {
             if let Err(e) = client.set_recording(&body) {
                 let _ = tx.send(BgEvent::Status(format!("Recording API: {e}")));
@@ -694,8 +809,8 @@ impl eframe::App for DirectorApp {
                 egui::ViewportId::from_hash_of("director_hud"),
                 egui::ViewportBuilder::default()
                     .with_title("Director")
-                    .with_inner_size([520.0, 76.0])
-                    .with_min_inner_size([360.0, 64.0])
+                    .with_inner_size([560.0, 68.0])
+                    .with_min_inner_size([420.0, 62.0])
                     .with_always_on_top()
                     .with_maximize_button(false)
                     .with_close_button(true),
@@ -777,29 +892,18 @@ impl eframe::App for DirectorApp {
 
         egui::TopBottomPanel::bottom("deck").exact_height(58.0).show(ctx, |ui| {
             ui.set_min_width(ui.available_width());
-            let t = chrome::transport_bar(ui, &self.playback, self.recording.recording);
-            if t.play {
-                self.apply_action(Action::PlayPause);
-            }
-            if t.back {
-                self.apply_action(Action::SeekBack);
-            }
-            if t.fwd {
-                self.apply_action(Action::SeekFwd);
-            }
-            if t.key {
-                self.apply_action(Action::Keyframe);
-            }
-            if t.seq {
-                self.apply_action(Action::PlaySeq);
-            }
-            if t.rec {
-                self.apply_action(Action::RecordToggle);
-            }
-            if let Some(time) = t.seek {
-                self.post_playback(serde_json::json!({ "time": time, "paused": true }));
-                self.playback.time = time;
-            }
+            let t = chrome::transport_bar(
+                ui,
+                chrome::DeckIn {
+                    playback: &self.playback,
+                    recording: self.recording.recording,
+                    rec_blocked: self.rec_blocked,
+                    clip_in: self.clip_in,
+                    clip_out: self.clip_out,
+                    compact: false,
+                },
+            );
+            self.apply_deck(t);
         });
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
@@ -817,25 +921,36 @@ impl eframe::App for DirectorApp {
 
 impl DirectorApp {
     fn ui_look(&mut self, ui: &mut Ui) {
-        chrome::section(ui, "Look");
-        ui.label(
-            RichText::new("Transport lives on the deck at the bottom.")
-                .small()
-                .color(COL_MUTE),
-        );
-        ui.add_space(6.0);
         self.ui_render(ui);
     }
 
     fn ui_cut(&mut self, ui: &mut Ui) {
-        chrome::section(ui, "Cut");
-        self.ui_sequence(ui);
-        ui.add_space(8.0);
-        ui.collapsing(RichText::new("Visibility").color(COL_MUTE), |ui| {
-            self.ui_visibility(ui);
-        });
-        ui.collapsing(RichText::new("Particles").color(COL_MUTE), |ui| {
-            self.ui_particles(ui);
+        let rail_w = 228.0;
+        let avail = ui.available_width();
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2((avail - rail_w - 12.0).max(360.0), ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    chrome::section(ui, "Sequence");
+                    self.ui_sequence(ui);
+                },
+            );
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(rail_w, ui.available_height()),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    chrome::section(ui, "Visibility");
+                    egui::ScrollArea::vertical()
+                        .id_salt("cut-vis")
+                        .max_height(ui.available_height() * 0.48)
+                        .show(ui, |ui| self.ui_visibility(ui));
+                    ui.add_space(8.0);
+                    chrome::section(ui, "Particles");
+                    self.ui_particles(ui);
+                },
+            );
         });
     }
 
@@ -992,9 +1107,6 @@ impl DirectorApp {
         if self.lcu_busy {
             ui.colored_label(Color32::LIGHT_BLUE, "LCU busy (scan + metadata + watch)…");
         }
-        if !self.lcu_line.is_empty() {
-            ui.label(RichText::new(&self.lcu_line).small());
-        }
         ui.add_space(8.0);
         ui.label("Replay API: https://127.0.0.1:2999  ·  not affiliated with Riot Games.");
         ui.add_space(12.0);
@@ -1048,282 +1160,372 @@ impl DirectorApp {
     }
 
     fn ui_render(&mut self, ui: &mut Ui) {
+        if !ui.input(|i| i.pointer.any_down()) {
+            self.look_dragging = false;
+        }
         ui.add_enabled_ui(self.connected, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let client = self.client.clone();
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Presets").strong());
-                    if ui.button("Cinematic").clicked() {
+                    if chrome::preset_btn(ui, "Cinematic", true) {
                         self.snapshot_render();
                         let _ = client.set_render(&presets::cinematic());
                     }
-                    if ui.button("Gameplay").clicked() {
+                    if chrome::preset_btn(ui, "Gameplay", false) {
                         self.snapshot_render();
                         let _ = client.set_render(&presets::gameplay());
                     }
-                    if ui.button("Broadcast").clicked() {
+                    if chrome::preset_btn(ui, "Broadcast", false) {
                         self.snapshot_render();
                         let _ = client.set_render(&presets::broadcast());
                     }
-                    if ui.button("Undo look (⌘Z)").clicked() {
-                        self.undo();
-                    }
-                    if ui.button("Reset look").clicked() {
+                    if chrome::preset_btn(ui, "Reset", false) {
                         self.reset_look();
                     }
                 });
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Camera mode");
-                    ui.label(&self.render.camera_mode);
-                    if ui.button("FPS").clicked() {
-                        let _ = client.set_render(&serde_json::json!({ "cameraMode": "fps" }));
-                    }
-                    if ui.button("Top").clicked() {
-                        let _ = client.set_render(&serde_json::json!({ "cameraMode": "top" }));
-                    }
-                });
-                vec3_row(ui, "Position", &mut self.render.camera_position, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraPosition": v }));
-                });
-                vec3_row(ui, "Rotation", &mut self.render.camera_rotation, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraRotation": v }));
-                });
+                ui.add_space(10.0);
+                let fov_before = self.render.field_of_view;
+                let (tight_wide, snap) = chrome::fov_strip(ui, &mut self.render.field_of_view);
+                if snap {
+                    let next = self.render.field_of_view;
+                    self.render.field_of_view = fov_before;
+                    self.snapshot_render();
+                    self.render.field_of_view = next;
+                    self.look_dragging = true;
+                }
                 {
                     let before = self.render.field_of_view;
-                    let resp = ui.add(Slider::new(&mut self.render.field_of_view, 5.0..=120.0).text("FOV"));
+                    let resp = ui.add(
+                        Slider::new(&mut self.render.field_of_view, 5.0..=120.0)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
                     if resp.drag_started() {
+                        self.look_dragging = true;
                         let mut r = self.render.clone();
                         r.field_of_view = before;
                         if let Ok(mut g) = self.edits.lock() {
                             g.push(Edit::Render(r));
                         }
                     }
-                    if resp.changed() {
-                        let _ = client.set_render(&serde_json::json!({ "fieldOfView": self.render.field_of_view }));
+                    if resp.changed() || tight_wide {
+                        let _ = client.set_render(
+                            &serde_json::json!({ "fieldOfView": self.render.field_of_view }),
+                        );
                     }
                 }
-                float_row(ui, "Near clip", &mut self.render.near_clip, 0.1..=5000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "nearClip": v }));
-                });
-                float_row(ui, "Far clip", &mut self.render.far_clip, 100.0..=100000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "farClip": v }));
-                });
-                float_row(
-                    ui,
-                    "Move speed",
-                    &mut self.render.camera_move_speed,
-                    0.0..=10000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "cameraMoveSpeed": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "Look speed",
-                    &mut self.render.camera_look_speed,
-                    0.0..=5.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "cameraLookSpeed": v }));
-                    },
-                );
-                bool_row(ui, "Camera attached", &mut self.render.camera_attached, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraAttached": v }));
-                });
-                bool_row(ui, "Lock X", &mut self.render.camera_lock_x, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraLockX": v }));
-                });
-                bool_row(ui, "Lock Y", &mut self.render.camera_lock_y, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraLockY": v }));
-                });
-                bool_row(ui, "Lock Z", &mut self.render.camera_lock_z, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "cameraLockZ": v }));
-                });
 
-                ui.separator();
-                ui.label(RichText::new("Skybox").strong());
+                ui.add_space(8.0);
+                chrome::section(ui, "Looks");
                 ui.horizontal(|ui| {
-                    let current = self
-                        .render
-                        .skybox_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&self.render.skybox_path)
-                        .to_string();
-                    egui::ComboBox::from_id_salt("skybox")
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.look_name)
+                            .desired_width(160.0)
+                            .hint_text("name this grade"),
+                    );
+                    if ui.button("Save look").clicked() {
+                        let look = looks::SavedLook::from_render(&self.look_name, &self.render);
+                        match looks::save(&look) {
+                            Ok(p) => {
+                                self.settings.last_look = look.name.clone();
+                                self.settings.save();
+                                self.status = format!("Saved look {}", p.display());
+                            }
+                            Err(e) => self.status = e,
+                        }
+                    }
+                    let files = looks::list();
+                    let current = self.settings.last_look.clone();
+                    egui::ComboBox::from_id_salt("look-lib")
                         .selected_text(if current.is_empty() {
-                            "(game default)".to_string()
+                            "(library)".into()
                         } else {
                             current
                         })
                         .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(self.render.skybox_path.is_empty(), "(game default)")
-                                .clicked()
-                            {
-                                let _ = client.set_render(&serde_json::json!({ "skyboxPath": "" }));
-                            }
-                            for (label, path) in &self.skyboxes {
-                                let p = path.display().to_string();
-                                if ui
-                                    .selectable_label(self.render.skybox_path == p, label)
-                                    .clicked()
-                                {
-                                    let _ = client.set_render(&serde_json::json!({ "skyboxPath": p }));
+                            for p in files {
+                                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("look");
+                                if ui.selectable_label(false, stem).clicked() {
+                                    if let Ok(look) = looks::load(&p) {
+                                        self.snapshot_render();
+                                        self.look_name = look.name.clone();
+                                        self.settings.last_look = look.name.clone();
+                                        self.settings.save();
+                                        let _ = client.set_render(&look.to_patch());
+                                        self.status = format!("Applied look {stem}");
+                                    }
                                 }
                             }
                         });
-                    if ui.small_button("Choose .dds…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("dds", &["dds"]).pick_file() {
-                            let p = path.display().to_string();
-                            let _ = client.set_render(&serde_json::json!({ "skyboxPath": p }));
-                            self.skyboxes = detect::list_skyboxes();
+                    if ui.small_button("Delete").clicked() {
+                        let path = looks::dir().join(format!("{}.json", self.look_name));
+                        if looks::delete(&path).is_ok() {
+                            self.settings.last_look.clear();
+                            self.settings.save();
+                            self.status = "Look deleted.".into();
                         }
                     }
-                    if ui.small_button("Skybox folder").clicked() {
-                        let dir = crate::settings::config_dir().join("skyboxes");
+                    if ui.small_button("Folder").clicked() {
+                        let dir = looks::dir();
                         let _ = std::fs::create_dir_all(&dir);
                         permissions::open_folder(&dir);
                     }
                 });
-                if self.skyboxes.is_empty() {
-                    ui.label(
-                        RichText::new(
-                            "No .dds found. Copy skyboxes (from a Python resources/skyboxes install) into ~/Documents/LeagueDirector/skyboxes.",
-                        )
+                ui.label(
+                    RichText::new("A look stores FOV, sky, fog, and DOF — not camera position.")
                         .small()
-                        .weak(),
+                        .color(COL_MUTE),
+                );
+
+                chrome::group(ui, "Camera", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Mode").color(COL_MUTE));
+                        ui.label(&self.render.camera_mode);
+                        if ui.button("FPS").clicked() {
+                            let _ = client.set_render(&serde_json::json!({ "cameraMode": "fps" }));
+                        }
+                        if ui.button("Top").clicked() {
+                            let _ = client.set_render(&serde_json::json!({ "cameraMode": "top" }));
+                        }
+                    });
+                    vec3_row(ui, "Position", &mut self.render.camera_position, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "cameraPosition": v }));
+                    });
+                    vec3_row(ui, "Rotation", &mut self.render.camera_rotation, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "cameraRotation": v }));
+                    });
+                    float_row(
+                        ui,
+                        "Move speed",
+                        &mut self.render.camera_move_speed,
+                        0.0..=10000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraMoveSpeed": v }));
+                        },
                     );
-                }
-                float_row(
-                    ui,
-                    "Skybox rotation",
-                    &mut self.render.skybox_rotation,
-                    -180.0..=180.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "skyboxRotation": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "Skybox radius",
-                    &mut self.render.skybox_radius,
-                    0.0..=100000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "skyboxRadius": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "Skybox offset",
-                    &mut self.render.skybox_offset,
-                    -100000.0..=100000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "skyboxOffset": v }));
-                    },
-                );
-                vec3_row(ui, "Soleil", &mut self.render.sun_direction, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "sunDirection": v }));
+                    float_row(
+                        ui,
+                        "Look speed",
+                        &mut self.render.camera_look_speed,
+                        0.0..=5.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraLookSpeed": v }));
+                        },
+                    );
+                    ui.horizontal(|ui| {
+                        bool_row(ui, "Attached", &mut self.render.camera_attached, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraAttached": v }));
+                        });
+                        bool_row(ui, "Lock X", &mut self.render.camera_lock_x, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraLockX": v }));
+                        });
+                        bool_row(ui, "Lock Y", &mut self.render.camera_lock_y, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraLockY": v }));
+                        });
+                        bool_row(ui, "Lock Z", &mut self.render.camera_lock_z, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "cameraLockZ": v }));
+                        });
+                    });
+                    ui.collapsing("Clip planes", |ui| {
+                        float_row(ui, "Near clip", &mut self.render.near_clip, 0.1..=5000.0, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "nearClip": v }));
+                        });
+                        float_row(ui, "Far clip", &mut self.render.far_clip, 100.0..=100000.0, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "farClip": v }));
+                        });
+                    });
                 });
 
-                ui.separator();
-                bool_row(ui, "Fog depth", &mut self.render.depth_fog_enabled, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthFogEnabled": v }));
-                });
-                float_row(ui, "Fog start", &mut self.render.depth_fog_start, 0.0..=100000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthFogStart": v }));
-                });
-                float_row(ui, "Fog end", &mut self.render.depth_fog_end, 0.0..=100000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthFogEnd": v }));
-                });
-                float_row(
-                    ui,
-                    "Fog intensity",
-                    &mut self.render.depth_fog_intensity,
-                    0.0..=1.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "depthFogIntensity": v }));
-                    },
-                );
-                color_row(ui, "Fog color", &mut self.render.depth_fog_color, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthFogColor": v }));
-                });
-                bool_row(ui, "Fog height", &mut self.render.height_fog_enabled, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "heightFogEnabled": v }));
-                });
-                float_row(
-                    ui,
-                    "Height fog start",
-                    &mut self.render.height_fog_start,
-                    -10000.0..=10000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "heightFogStart": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "Height fog end",
-                    &mut self.render.height_fog_end,
-                    -10000.0..=10000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "heightFogEnd": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "Height fog intensity",
-                    &mut self.render.height_fog_intensity,
-                    0.0..=1.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "heightFogIntensity": v }));
-                    },
-                );
-
-                ui.separator();
-                bool_row(ui, "Depth of field", &mut self.render.depth_of_field_enabled, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthOfFieldEnabled": v }));
-                });
-                bool_row(ui, "DOF debug", &mut self.render.depth_of_field_debug, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthOfFieldDebug": v }));
-                });
-                float_row(
-                    ui,
-                    "DOF circle",
-                    &mut self.render.depth_of_field_circle,
-                    0.0..=300.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "depthOfFieldCircle": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "DOF width",
-                    &mut self.render.depth_of_field_width,
-                    0.0..=10000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "depthOfFieldWidth": v }));
-                    },
-                );
-                float_row(
-                    ui,
-                    "DOF near",
-                    &mut self.render.depth_of_field_near,
-                    0.0..=100000.0,
-                    |v| {
-                        let _ = client.set_render(&serde_json::json!({ "depthOfFieldNear": v }));
-                    },
-                );
-                float_row(ui, "DOF mid", &mut self.render.depth_of_field_mid, 0.0..=100000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthOfFieldMid": v }));
-                });
-                float_row(ui, "DOF far", &mut self.render.depth_of_field_far, 0.0..=100000.0, |v| {
-                    let _ = client.set_render(&serde_json::json!({ "depthOfFieldFar": v }));
+                chrome::group(ui, "Sky", |ui| {
+                    ui.horizontal(|ui| {
+                        let current = self
+                            .render
+                            .skybox_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&self.render.skybox_path)
+                            .to_string();
+                        egui::ComboBox::from_id_salt("skybox")
+                            .selected_text(if current.is_empty() {
+                                "(game default)".to_string()
+                            } else {
+                                current
+                            })
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(self.render.skybox_path.is_empty(), "(game default)")
+                                    .clicked()
+                                {
+                                    let _ = client.set_render(&serde_json::json!({ "skyboxPath": "" }));
+                                }
+                                for (label, path) in &self.skyboxes {
+                                    let p = path.display().to_string();
+                                    if ui
+                                        .selectable_label(self.render.skybox_path == p, label)
+                                        .clicked()
+                                    {
+                                        let _ = client.set_render(&serde_json::json!({ "skyboxPath": p }));
+                                    }
+                                }
+                            });
+                        if ui.small_button("Choose .dds…").clicked() {
+                            if let Some(path) =
+                                rfd::FileDialog::new().add_filter("dds", &["dds"]).pick_file()
+                            {
+                                let p = path.display().to_string();
+                                let _ = client.set_render(&serde_json::json!({ "skyboxPath": p }));
+                                self.skyboxes = detect::list_skyboxes();
+                            }
+                        }
+                        if ui.small_button("Skybox folder").clicked() {
+                            let dir = crate::settings::config_dir().join("skyboxes");
+                            let _ = std::fs::create_dir_all(&dir);
+                            permissions::open_folder(&dir);
+                        }
+                    });
+                    if self.skyboxes.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "No .dds found. Copy skyboxes into ~/Documents/LeagueDirector/skyboxes.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
+                    float_row(
+                        ui,
+                        "Rotation",
+                        &mut self.render.skybox_rotation,
+                        -180.0..=180.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "skyboxRotation": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Radius",
+                        &mut self.render.skybox_radius,
+                        0.0..=100000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "skyboxRadius": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Offset",
+                        &mut self.render.skybox_offset,
+                        -100000.0..=100000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "skyboxOffset": v }));
+                        },
+                    );
+                    vec3_row(ui, "Sun", &mut self.render.sun_direction, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "sunDirection": v }));
+                    });
                 });
 
-                ui.separator();
-                if ui.button("Keyframe position + rotation + FOV (K)").clicked() {
+                chrome::group(ui, "Fog", |ui| {
+                    bool_row(ui, "Depth fog", &mut self.render.depth_fog_enabled, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthFogEnabled": v }));
+                    });
+                    float_row(ui, "Start", &mut self.render.depth_fog_start, 0.0..=100000.0, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthFogStart": v }));
+                    });
+                    float_row(ui, "End", &mut self.render.depth_fog_end, 0.0..=100000.0, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthFogEnd": v }));
+                    });
+                    float_row(
+                        ui,
+                        "Intensity",
+                        &mut self.render.depth_fog_intensity,
+                        0.0..=1.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthFogIntensity": v }));
+                        },
+                    );
+                    color_row(ui, "Color", &mut self.render.depth_fog_color, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthFogColor": v }));
+                    });
+                    bool_row(ui, "Height fog", &mut self.render.height_fog_enabled, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "heightFogEnabled": v }));
+                    });
+                    float_row(
+                        ui,
+                        "Height start",
+                        &mut self.render.height_fog_start,
+                        -10000.0..=10000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "heightFogStart": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Height end",
+                        &mut self.render.height_fog_end,
+                        -10000.0..=10000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "heightFogEnd": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Height intensity",
+                        &mut self.render.height_fog_intensity,
+                        0.0..=1.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "heightFogIntensity": v }));
+                        },
+                    );
+                });
+
+                chrome::group(ui, "Depth of field", |ui| {
+                    ui.horizontal(|ui| {
+                        bool_row(ui, "Enabled", &mut self.render.depth_of_field_enabled, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthOfFieldEnabled": v }));
+                        });
+                        bool_row(ui, "Debug", &mut self.render.depth_of_field_debug, |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthOfFieldDebug": v }));
+                        });
+                    });
+                    float_row(
+                        ui,
+                        "Circle",
+                        &mut self.render.depth_of_field_circle,
+                        0.0..=300.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthOfFieldCircle": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Width",
+                        &mut self.render.depth_of_field_width,
+                        0.0..=10000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthOfFieldWidth": v }));
+                        },
+                    );
+                    float_row(
+                        ui,
+                        "Near",
+                        &mut self.render.depth_of_field_near,
+                        0.0..=100000.0,
+                        |v| {
+                            let _ = client.set_render(&serde_json::json!({ "depthOfFieldNear": v }));
+                        },
+                    );
+                    float_row(ui, "Mid", &mut self.render.depth_of_field_mid, 0.0..=100000.0, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthOfFieldMid": v }));
+                    });
+                    float_row(ui, "Far", &mut self.render.depth_of_field_far, 0.0..=100000.0, |v| {
+                        let _ = client.set_render(&serde_json::json!({ "depthOfFieldFar": v }));
+                    });
+                });
+
+                ui.add_space(8.0);
+                if ui.button("Keyframe camera + FOV (K) — opens Cut").clicked() {
                     self.add_camera_keyframes();
-                    self.tab = 4;
+                    self.tab = 2;
                 }
             });
         });
@@ -1331,7 +1533,7 @@ impl DirectorApp {
 
     fn ui_visibility(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(self.connected, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            {
                 for (label, field, key) in [
                     ("Fog of war", self.render.fog_of_war, "fogOfWar"),
                     ("UI", self.render.interface_all, "interfaceAll"),
@@ -1363,17 +1565,16 @@ impl DirectorApp {
                         self.post_render(serde_json::json!({ key: v }));
                     }
                 }
-            });
+            }
         });
     }
 
     fn ui_sequence(&mut self, ui: &mut Ui) {
         ui.add_enabled_ui(self.connected, |ui| {
             ui.label(
-                RichText::new(
-                    "Shortcuts (Keys tab to remap) also work while League is frontmost.",
-                )
-                .small(),
+                RichText::new("Shortcuts also work while League is frontmost. Remap under Connect → Key bindings.")
+                    .small()
+                    .color(COL_MUTE),
             );
             ui.horizontal(|ui| {
                 ui.label("Sequence");
@@ -1716,10 +1917,39 @@ impl DirectorApp {
                 ui.selectable_value(&mut self.rec_codec, "png".into(), "png");
             });
             ui.add(Slider::new(&mut self.rec_fps, 10.0..=60.0).text("FPS"));
-            ui.add(Slider::new(&mut self.rec_start, 0.0..=self.playback.length.max(1.0)).text("Start"));
-            ui.add(Slider::new(&mut self.rec_end, 0.0..=self.playback.length.max(1.0)).text("End"));
-            if ui.button("Record").clicked() {
-                self.start_recording(self.rec_start, self.rec_end);
+            ui.label(
+                RichText::new(format!(
+                    "Deck marks: IN {} · OUT {}  (webm clamped to {}s)",
+                    self.clip_in
+                        .map(Playback::format_time)
+                        .unwrap_or_else(|| "playhead".into()),
+                    self.clip_out
+                        .map(Playback::format_time)
+                        .unwrap_or_else(|| "+8s".into()),
+                    media::MAX_WEBM_SECS
+                ))
+                .small()
+                .color(COL_MUTE),
+            );
+            if ui
+                .add(Slider::new(&mut self.rec_start, 0.0..=self.playback.length.max(1.0)).text("Start"))
+                .changed()
+            {
+                self.clip_in = Some(self.rec_start);
+            }
+            if ui
+                .add(Slider::new(&mut self.rec_end, 0.0..=self.playback.length.max(1.0)).text("End"))
+                .changed()
+            {
+                self.clip_out = Some(self.rec_end);
+            }
+            if ui.button("Record marked range").clicked() {
+                let (a, b) = self.clip_range();
+                self.start_recording(a, b);
+            }
+            if ui.button("Record playhead +8s").clicked() {
+                let start = self.playback.time;
+                self.start_recording(start, (start + 8.0).min(self.playback.length.max(start + 0.5)));
             }
             if ui.button("Record sequence (auto range)").clicked() {
                 if let (Some(a), Some(b)) = (self.sequence.first_time(), self.sequence.last_time()) {
@@ -1738,7 +1968,7 @@ impl DirectorApp {
             let p = ((self.recording.current_time - self.recording.start_time) / span) as f32;
             ui.add(egui::ProgressBar::new(p.clamp(0.0, 1.0)));
             ui.label(&self.recording.path);
-            if ui.button("Annuler").clicked() {
+            if ui.button("Cancel").clicked() {
                 let _ = self.client.set_recording(&serde_json::json!({ "recording": false }));
             }
         }
@@ -1825,77 +2055,23 @@ impl DirectorApp {
     }
 
     fn ui_hud(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let play = if self.playback.paused { "Play" } else { "Pause" };
-                if ui.button(play).clicked() {
-                    self.apply_action(Action::PlayPause);
-                }
-                if ui.button("−5s").clicked() {
-                    self.apply_action(Action::SeekBack);
-                }
-                if ui.button("+5s").clicked() {
-                    self.apply_action(Action::SeekFwd);
-                }
-                if ui.button("K").clicked() {
-                    self.apply_action(Action::Keyframe);
-                }
-                if ui.button("Seq").clicked() {
-                    self.apply_action(Action::PlaySeq);
-                }
-                let rec = if self.recording.recording { "Stop rec" } else { "Rec" };
-                if ui.button(rec).clicked() {
-                    self.apply_action(Action::RecordToggle);
-                }
-                if ui.button("Cinema").clicked() {
-                    self.apply_action(Action::Cinematic);
-                }
-                if ui.button("Undo").clicked() {
-                    self.undo();
-                }
-                if ui.button("Reset look").clicked() {
-                    self.reset_look();
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(if crate::hotkeys::tap_is_live() {
-                        "keys on"
-                    } else {
-                        "keys off — Grant keys"
-                    })
-                    .small(),
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(chrome::BG).inner_margin(0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(ui.available_width());
+                let t = chrome::transport_bar(
+                    ui,
+                    chrome::DeckIn {
+                        playback: &self.playback,
+                        recording: self.recording.recording,
+                        rec_blocked: self.rec_blocked,
+                        clip_in: self.clip_in,
+                        clip_out: self.clip_out,
+                        compact: true,
+                    },
                 );
-                if !self.last_hotkey.is_empty() {
-                    ui.label(
-                        RichText::new(&self.last_hotkey)
-                            .small()
-                            .color(Color32::from_rgb(80, 200, 140)),
-                    );
-                }
+                self.apply_deck(t);
             });
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} / {}",
-                        Playback::format_time(self.playback.time),
-                        Playback::format_time(self.playback.length)
-                    ))
-                    .font(FontId::monospace(16.0))
-                    .color(COL_TEXT),
-                );
-                ui.label(format!(
-                    "  {}",
-                    if self.recording.recording {
-                        "REC"
-                    } else if self.connected {
-                        "live"
-                    } else {
-                        "idle"
-                    }
-                ));
-            });
-        });
     }
 
     fn ui_particles(&mut self, ui: &mut Ui) {

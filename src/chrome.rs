@@ -1,6 +1,6 @@
 use crate::api::Playback;
 use eframe::egui::{
-    self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
+    self, Color32, FontId, Frame, Margin, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
 pub const BG: Color32 = Color32::from_rgb(0x14, 0x14, 0x16);
@@ -34,6 +34,69 @@ pub fn lamp(ui: &mut Ui, on: bool, label: &str) {
         );
         ui.label(RichText::new(label).size(12.0).color(if on { TEXT } else { MUTE }));
     });
+}
+
+pub fn group(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+    ui.add_space(8.0);
+    Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0_f32, LINE))
+        .inner_margin(Margin::symmetric(12, 10))
+        .corner_radius(3.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section(ui, title);
+            add(ui);
+        });
+}
+
+pub fn preset_btn(ui: &mut Ui, label: &str, primary: bool) -> bool {
+    let fill = if primary {
+        Color32::from_rgb(0x2A, 0x24, 0x18)
+    } else {
+        Color32::from_rgb(0x24, 0x24, 0x28)
+    };
+    let ink = if primary { AMBER } else { TEXT };
+    ui.add(
+        egui::Button::new(RichText::new(label).size(13.0).color(ink))
+            .fill(fill)
+            .min_size(Vec2::new(108.0, 34.0)),
+    )
+    .clicked()
+}
+
+/// Large FOV control. Returns (changed, drag_started).
+pub fn fov_strip(ui: &mut Ui, fov: &mut f64) -> (bool, bool) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("FOV")
+                .size(11.0)
+                .color(MUTE)
+                .extra_letter_spacing(1.2),
+        );
+        ui.label(
+            RichText::new(format!("{fov:.0}°"))
+                .font(FontId::monospace(22.0))
+                .color(TEXT),
+        );
+        ui.add_space(8.0);
+        if ui
+            .add(egui::Button::new(RichText::new("Tight").size(11.0).color(MUTE)).fill(RAIL))
+            .clicked()
+        {
+            *fov = 28.0;
+            return (true, true);
+        }
+        if ui
+            .add(egui::Button::new(RichText::new("Wide").size(11.0).color(MUTE)).fill(RAIL))
+            .clicked()
+        {
+            *fov = 70.0;
+            return (true, true);
+        }
+        (false, false)
+    })
+    .inner
 }
 
 pub fn desk_switcher(ui: &mut Ui, current: usize) -> Option<usize> {
@@ -83,6 +146,15 @@ pub fn desk_switcher(ui: &mut Ui, current: usize) -> Option<usize> {
     picked
 }
 
+pub struct DeckIn<'a> {
+    pub playback: &'a Playback,
+    pub recording: bool,
+    pub rec_blocked: bool,
+    pub clip_in: Option<f64>,
+    pub clip_out: Option<f64>,
+    pub compact: bool,
+}
+
 pub struct TransportOut {
     pub play: bool,
     pub back: bool,
@@ -90,20 +162,36 @@ pub struct TransportOut {
     pub key: bool,
     pub seq: bool,
     pub rec: bool,
+    pub mark_in: bool,
+    pub mark_out: bool,
+    pub clear_marks: bool,
     pub seek: Option<f64>,
+    pub undo: bool,
+    pub reset: bool,
 }
 
-pub fn transport_bar(ui: &mut Ui, playback: &Playback, recording: bool) -> TransportOut {
-    let mut out = TransportOut {
-        play: false,
-        back: false,
-        fwd: false,
-        key: false,
-        seq: false,
-        rec: false,
-        seek: None,
-    };
-    let h = 56.0;
+impl Default for TransportOut {
+    fn default() -> Self {
+        Self {
+            play: false,
+            back: false,
+            fwd: false,
+            key: false,
+            seq: false,
+            rec: false,
+            mark_in: false,
+            mark_out: false,
+            clear_marks: false,
+            seek: None,
+            undo: false,
+            reset: false,
+        }
+    }
+}
+
+pub fn transport_bar(ui: &mut Ui, deck: DeckIn<'_>) -> TransportOut {
+    let mut out = TransportOut::default();
+    let h = if deck.compact { 62.0 } else { 58.0 };
     let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
     let painter = ui.painter_at(bar);
     painter.rect_filled(bar, 0.0, Color32::from_rgb(0x12, 0x12, 0x14));
@@ -112,11 +200,12 @@ pub fn transport_bar(ui: &mut Ui, playback: &Playback, recording: bool) -> Trans
         Stroke::new(1.0_f32, LINE),
     );
 
-    let mut x = bar.left() + 12.0;
+    let mut x = bar.left() + 10.0;
     let mid_y = bar.center().y - 6.0;
-    let btn = |ui: &Ui, x: &mut f32, label: &str, fill: Color32, ink: Color32| {
-        let r = Rect::from_center_size(Pos2::new(*x + 22.0, mid_y), Vec2::new(44.0, 28.0));
-        *x += 50.0;
+    let btn_w = if deck.compact { 40.0 } else { 44.0 };
+    let btn = |ui: &Ui, x: &mut f32, label: &str, fill: Color32, ink: Color32, w: f32| {
+        let r = Rect::from_center_size(Pos2::new(*x + w * 0.5, mid_y), Vec2::new(w, 28.0));
+        *x += w + 6.0;
         let resp = ui.interact(r, ui.id().with(("tr", label)), Sense::click());
         let bg = if resp.hovered() {
             Color32::from_rgb(0x32, 0x32, 0x38)
@@ -128,48 +217,115 @@ pub fn transport_bar(ui: &mut Ui, playback: &Playback, recording: bool) -> Trans
             r.center(),
             egui::Align2::CENTER_CENTER,
             label,
-            FontId::proportional(12.0),
+            FontId::proportional(11.0),
             ink,
         );
         resp.clicked()
     };
 
-    let play_lab = if playback.paused { "PLAY" } else { "PAUSE" };
-    if btn(ui, &mut x, play_lab, Color32::from_rgb(0x24, 0x24, 0x28), TEXT) {
+    let play_lab = if deck.playback.paused { "PLAY" } else { "PAUSE" };
+    if btn(ui, &mut x, play_lab, Color32::from_rgb(0x24, 0x24, 0x28), TEXT, btn_w + 8.0) {
         out.play = true;
     }
-    if btn(ui, &mut x, "−5", Color32::from_rgb(0x24, 0x24, 0x28), TEXT) {
+    if btn(ui, &mut x, "−5", Color32::from_rgb(0x24, 0x24, 0x28), TEXT, btn_w) {
         out.back = true;
     }
-    if btn(ui, &mut x, "+5", Color32::from_rgb(0x24, 0x24, 0x28), TEXT) {
+    if btn(ui, &mut x, "+5", Color32::from_rgb(0x24, 0x24, 0x28), TEXT, btn_w) {
         out.fwd = true;
     }
-    if btn(ui, &mut x, "K", Color32::from_rgb(0x2A, 0x24, 0x18), AMBER) {
+    if btn(ui, &mut x, "K", Color32::from_rgb(0x2A, 0x24, 0x18), AMBER, btn_w) {
         out.key = true;
     }
-    if btn(ui, &mut x, "SEQ", Color32::from_rgb(0x24, 0x24, 0x28), TEXT) {
+    if btn(ui, &mut x, "SEQ", Color32::from_rgb(0x24, 0x24, 0x28), TEXT, btn_w) {
         out.seq = true;
     }
-    let rec_fill = if recording {
+    if !deck.compact {
+        let in_fill = if deck.clip_in.is_some() {
+            Color32::from_rgb(0x18, 0x28, 0x20)
+        } else {
+            Color32::from_rgb(0x24, 0x24, 0x28)
+        };
+        if btn(ui, &mut x, "IN", in_fill, if deck.clip_in.is_some() { LIVE } else { TEXT }, btn_w) {
+            out.mark_in = true;
+        }
+        let out_fill = if deck.clip_out.is_some() {
+            Color32::from_rgb(0x28, 0x18, 0x18)
+        } else {
+            Color32::from_rgb(0x24, 0x24, 0x28)
+        };
+        if btn(
+            ui,
+            &mut x,
+            "OUT",
+            out_fill,
+            if deck.clip_out.is_some() { REC } else { TEXT },
+            btn_w,
+        ) {
+            out.mark_out = true;
+        }
+        if (deck.clip_in.is_some() || deck.clip_out.is_some())
+            && btn(ui, &mut x, "CLR", Color32::from_rgb(0x24, 0x24, 0x28), MUTE, 36.0)
+        {
+            out.clear_marks = true;
+        }
+    }
+    let rec_fill = if deck.recording {
         REC
+    } else if deck.rec_blocked {
+        Color32::from_rgb(0x3A, 0x28, 0x18)
     } else {
         Color32::from_rgb(0x28, 0x18, 0x18)
     };
-    if btn(ui, &mut x, "REC", rec_fill, if recording { TEXT } else { REC }) {
+    let rec_ink = if deck.recording {
+        TEXT
+    } else if deck.rec_blocked {
+        AMBER
+    } else {
+        REC
+    };
+    let rec_lab = if deck.recording {
+        "STOP"
+    } else if deck.rec_blocked {
+        "WAIT"
+    } else {
+        "REC"
+    };
+    if btn(ui, &mut x, rec_lab, rec_fill, rec_ink, btn_w + 4.0) {
         out.rec = true;
+    }
+    if deck.compact {
+        if btn(ui, &mut x, "UNDO", Color32::from_rgb(0x24, 0x24, 0x28), TEXT, 48.0) {
+            out.undo = true;
+        }
+        if btn(ui, &mut x, "RST", Color32::from_rgb(0x24, 0x24, 0x28), MUTE, 40.0) {
+            out.reset = true;
+        }
     }
 
     let tc = format!(
         "{}   /   {}",
-        Playback::format_time(playback.time),
-        Playback::format_time(playback.length)
+        Playback::format_time(deck.playback.time),
+        Playback::format_time(deck.playback.length)
     );
     painter.text(
-        Pos2::new(bar.right() - 16.0, mid_y),
+        Pos2::new(bar.right() - 16.0, mid_y - 2.0),
         egui::Align2::RIGHT_CENTER,
         tc,
-        FontId::monospace(18.0),
+        FontId::monospace(if deck.compact { 16.0 } else { 18.0 }),
         TEXT,
+    );
+    let mark = match (deck.clip_in, deck.clip_out) {
+        (Some(a), Some(b)) => format!("IN {}  OUT {}", Playback::format_time(a), Playback::format_time(b)),
+        (Some(a), None) => format!("IN {}  ·  Rec +8s", Playback::format_time(a)),
+        (None, Some(b)) => format!("OUT {}  ·  Rec −8s", Playback::format_time(b)),
+        _ => "Rec playhead +8s".into(),
+    };
+    painter.text(
+        Pos2::new(bar.right() - 16.0, mid_y + 14.0),
+        egui::Align2::RIGHT_CENTER,
+        mark,
+        FontId::proportional(10.0),
+        MUTE,
     );
 
     let scrub = Rect::from_min_max(
@@ -177,11 +333,31 @@ pub fn transport_bar(ui: &mut Ui, playback: &Playback, recording: bool) -> Trans
         Pos2::new(bar.right() - 12.0, bar.bottom() - 5.0),
     );
     painter.rect_filled(scrub, 1.0, Color32::from_rgb(0x2A, 0x2A, 0x30));
-    let t = if playback.length > 0.1 {
-        (playback.time / playback.length).clamp(0.0, 1.0) as f32
-    } else {
-        0.0
-    };
+    let len = deck.playback.length.max(0.1);
+    let x_of = |t: f64| scrub.left() + (t / len).clamp(0.0, 1.0) as f32 * scrub.width();
+    if let (Some(a), Some(b)) = (deck.clip_in, deck.clip_out) {
+        let (lo, hi) = if b >= a { (a, b) } else { (b, a) };
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(x_of(lo), scrub.top()), Pos2::new(x_of(hi), scrub.bottom())),
+            1.0,
+            Color32::from_rgba_unmultiplied(0xE2, 0x4B, 0x4A, 70),
+        );
+    }
+    if let Some(a) = deck.clip_in {
+        let x = x_of(a);
+        painter.line_segment(
+            [Pos2::new(x, scrub.top() - 2.0), Pos2::new(x, scrub.bottom() + 2.0)],
+            Stroke::new(1.5_f32, LIVE),
+        );
+    }
+    if let Some(b) = deck.clip_out {
+        let x = x_of(b);
+        painter.line_segment(
+            [Pos2::new(x, scrub.top() - 2.0), Pos2::new(x, scrub.bottom() + 2.0)],
+            Stroke::new(1.5_f32, REC),
+        );
+    }
+    let t = (deck.playback.time / len).clamp(0.0, 1.0) as f32;
     let head = scrub.left() + t * scrub.width();
     painter.rect_filled(
         Rect::from_min_max(scrub.min, Pos2::new(head, scrub.bottom())),
@@ -189,9 +365,9 @@ pub fn transport_bar(ui: &mut Ui, playback: &Playback, recording: bool) -> Trans
         AMBER,
     );
     let scrub_id = ui.interact(scrub.expand(4.0), ui.id().with("scrub"), Sense::click_and_drag());
-    if (scrub_id.clicked() || scrub_id.dragged()) && playback.length > 0.1 {
+    if (scrub_id.clicked() || scrub_id.dragged()) && deck.playback.length > 0.1 {
         if let Some(pos) = scrub_id.interact_pointer_pos() {
-            let nt = ((pos.x - scrub.left()) / scrub.width()).clamp(0.0, 1.0) as f64 * playback.length;
+            let nt = ((pos.x - scrub.left()) / scrub.width()).clamp(0.0, 1.0) as f64 * deck.playback.length;
             out.seek = Some(nt);
         }
     }

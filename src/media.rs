@@ -4,6 +4,9 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Long webm encodes hang the Replay API. Keep clips short.
+pub const MAX_WEBM_SECS: f64 = 16.0;
+
 /// If League left a `.webm.tmp`, remux it to a playable `.webm` next to it
 /// (and copy into `dest_dir` if different).
 pub fn finalize_recording(path_hint: &str, dest_dir: &str) -> Option<PathBuf> {
@@ -76,21 +79,21 @@ pub fn spawn_watchdog(
         let min_wait = expected_secs.max(1.0);
         thread::sleep(Duration::from_secs_f64(min_wait));
         // Wait until the newest capture file stops growing (encode often outlives the API).
-        let deadline = Instant::now() + Duration::from_secs_f64((expected_secs + 45.0).clamp(8.0, 180.0));
+        let deadline = Instant::now() + Duration::from_secs_f64((expected_secs + 30.0).clamp(8.0, 90.0));
         let mut last_size = 0u64;
         let mut stable = 0u8;
         while Instant::now() < deadline {
             let size = newest_capture_size(&hint, &dest_dir).unwrap_or(0);
             if size > 0 && size == last_size {
                 stable += 1;
-                if stable >= 3 {
+                if stable >= 4 {
                     break;
                 }
             } else {
                 stable = 0;
                 last_size = size;
             }
-            thread::sleep(Duration::from_millis(700));
+            thread::sleep(Duration::from_millis(500));
         }
         let path = finalize_recording(&hint, &dest_dir);
         let secs = path.as_ref().and_then(|p| probe_duration(p));
@@ -173,6 +176,37 @@ pub fn ffmpeg_bin() -> Option<PathBuf> {
 
 pub fn ffmpeg_available() -> bool {
     ffmpeg_bin().is_some()
+}
+
+pub fn leftover_tmp(dest_dir: &str) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let Ok(rd) = fs::read_dir(dest_dir) else {
+        return None;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.ends_with(".webm.tmp") {
+            continue;
+        }
+        let Ok(t) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().map(|(ot, _)| t > *ot).unwrap_or(true) {
+            best = Some((t, p));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+pub fn clamp_webm_span(start: f64, end: f64) -> (f64, f64, bool) {
+    let span = (end - start).abs();
+    if span <= MAX_WEBM_SECS {
+        let (a, b) = if end >= start { (start, end) } else { (end, start) };
+        return (a, b.max(a + 0.5), false);
+    }
+    let a = start.min(end);
+    (a, a + MAX_WEBM_SECS, true)
 }
 
 pub fn list_clips(dirs: &[&str]) -> Vec<PathBuf> {

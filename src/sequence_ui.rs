@@ -45,75 +45,76 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
     let length = length.max(1.0);
     let tracks: [(&str, TrackId, usize, Color32); 8] = [
         (
-            "pos",
+            "POS",
             TrackId::Position,
             sequence.camera_position.len(),
             Color32::from_rgb(120, 180, 255),
         ),
         (
-            "rot",
+            "ROT",
             TrackId::Rotation,
             sequence.camera_rotation.len(),
             Color32::from_rgb(255, 170, 90),
         ),
         (
-            "fov",
+            "FOV",
             TrackId::Fov,
             sequence.field_of_view.len(),
             Color32::from_rgb(160, 220, 140),
         ),
         (
-            "spd",
+            "SPD",
             TrackId::Speed,
             sequence.playback_speed.len(),
             Color32::from_rgb(220, 140, 220),
         ),
         (
-            "fog",
+            "FOG",
             TrackId::Fog,
             sequence.depth_fog_enabled.len(),
             Color32::from_rgb(140, 200, 210),
         ),
         (
-            "dof",
+            "DOF",
             TrackId::Dof,
             sequence.depth_of_field_enabled.len(),
             Color32::from_rgb(230, 200, 120),
         ),
         (
-            "sky",
+            "SKY",
             TrackId::Sky,
             sequence.skybox_rotation.len(),
             Color32::from_rgb(180, 160, 255),
         ),
         (
-            "near",
+            "NEAR",
             TrackId::Near,
             sequence.near_clip.len(),
             Color32::from_rgb(130, 220, 190),
         ),
     ];
-    let row_h = 22.0;
-    let height = 12.0 + tracks.len() as f32 * row_h;
+    let row_h = 28.0;
+    let label_w = 52.0;
+    let height = 16.0 + tracks.len() as f32 * row_h;
     let (rect, bg) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::click());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, Color32::from_rgb(28, 28, 32));
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(0x18, 0x18, 0x1B));
 
     let mut event = None;
     for (i, (name, id, _n, color)) in tracks.iter().enumerate() {
-        let y0 = rect.top() + 6.0 + i as f32 * row_h;
-        let y1 = y0 + row_h - 4.0;
+        let y0 = rect.top() + 8.0 + i as f32 * row_h;
+        let y1 = y0 + row_h - 6.0;
         let row = Rect::from_min_max(
-            egui::pos2(rect.left() + 40.0, y0),
+            egui::pos2(rect.left() + label_w, y0),
             egui::pos2(rect.right() - 8.0, y1),
         );
-        painter.rect_filled(row, 2.0, Color32::from_rgb(40, 40, 46));
+        painter.rect_filled(row, 2.0, Color32::from_rgb(0x28, 0x28, 0x2E));
         painter.text(
-            egui::pos2(rect.left() + 6.0, (y0 + y1) * 0.5),
+            egui::pos2(rect.left() + 8.0, (y0 + y1) * 0.5),
             egui::Align2::LEFT_CENTER,
             *name,
-            egui::FontId::proportional(11.0),
-            Color32::GRAY,
+            egui::FontId::proportional(10.0),
+            Color32::from_rgb(0x7A, 0x7A, 0x82),
         );
 
         let times: Vec<f64> = match id {
@@ -159,16 +160,16 @@ pub fn draw_tracks(ui: &mut Ui, sequence: &Sequence, playhead: f64, length: f64)
         }
     }
 
-    let x = rect.left() + 40.0 + (playhead / length).clamp(0.0, 1.0) as f32 * (rect.width() - 48.0);
+    let x = rect.left() + label_w + (playhead / length).clamp(0.0, 1.0) as f32 * (rect.width() - label_w - 8.0);
     painter.line_segment(
         [egui::pos2(x, rect.top() + 4.0), egui::pos2(x, rect.bottom() - 4.0)],
-        egui::Stroke::new(1.5_f32, Color32::from_rgb(230, 80, 80)),
+        egui::Stroke::new(1.5_f32, Color32::from_rgb(0xE8, 0xA2, 0x3A)),
     );
 
     if event.is_none() && bg.clicked() {
         if let Some(pos) = bg.interact_pointer_pos() {
-            let left = rect.left() + 40.0;
-            let width = (rect.width() - 48.0).max(1.0);
+            let left = rect.left() + label_w;
+            let width = (rect.width() - label_w - 8.0).max(1.0);
             let nt = ((pos.x - left) / width).clamp(0.0, 1.0) as f64 * length;
             event = Some(TrackEvent::Seek(nt));
         }

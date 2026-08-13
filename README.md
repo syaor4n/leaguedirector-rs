@@ -43,15 +43,17 @@ In System Settings, grant **League Director.app** (not `cargo`):
 3. Tick your League install, Watch a `.rofl`. Director waits for the game process **and** `https://127.0.0.1:2999` (LCU 204 is not enough). If the game dies at loading, the Connect tab shows the r3dlog tail and Retry.
 4. Keep the HUD on top while filming. Do not start another recording while the API is down after an encode.
 
-Global hotkeys fire only while **League of Legends** (the game) is frontmost. Remap them in the Keys tab.
+Global hotkeys fire only while **League of Legends** (the game) is frontmost. Remap them under Connect → Key bindings.
 
-Recording: the game API often stalls while encoding. Director starts a watchdog and remuxes `.webm.tmp` → `.webm` (bundled `ffmpeg` if present). Clips show up in the Recording tab.
+Recording: mark In/Out on the bottom deck, or Rec for playhead +8s. Webm clips are clamped to 16s because longer encodes hang the Replay API. Director remuxes `.webm.tmp` → `.webm` (bundled `ffmpeg` if present). Clips show up on the Capture desk.
 
 ## Usage
 
-1. Connect tab: tick your League install (`EnableReplayApi=1`).
+1. Connect desk: tick your League install (`EnableReplayApi=1`).
 2. Watch a `.rofl` from the list, or **Open .rofl…**. The app copies it into `Contents/LoL/Replays` and asks LCU to play it. Do not launch `LeagueofLegends` with the file as an argument (crash).
-3. The app connects to `https://127.0.0.1:2999`.
+3. Look desk: FOV, cinematic presets, saved looks (grade only — not camera pose).
+4. Cut desk: sequencer + visibility / particles rail.
+5. Capture / deck: In/Out on the scrubber, then Rec.
 
 Shortcuts (Director window **or** League frontmost): `Space` play/pause · `←`/`→` ±5 s · `K` keyframe · `⌘Z` undo · `Enter` play sequence.
 

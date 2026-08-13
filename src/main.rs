@@ -7,6 +7,7 @@ mod edits;
 mod handshake;
 mod hotkeys;
 mod lcu;
+mod looks;
 mod media;
 mod permissions;
 mod presets;
